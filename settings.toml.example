@@ -1,0 +1,9 @@
+# WiFi Configuration for CircuitPython
+# Copy this file to settings.toml on your CIRCUITPY drive and fill in your credentials
+
+CIRCUITPY_WIFI_SSID = "AirOrangeX"
+# CIRCUITPY_WIFI_PASSWORD = ""
+
+# Optional: Configure CircuitPython web workflow port (default is 80)
+# CIRCUITPY_WEB_API_PORT = 80
+# CIRCUITPY_WEB_API_PASSWORD = "your_password"

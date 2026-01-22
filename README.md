@@ -22,7 +22,7 @@ Network connection:
 
 https://learn.adafruit.com/circuitpython-with-esp32-quick-start/setting-up-web-workflow
 
-Use the REPL to store a settings.toml file with the SSID, Wifi password, and web API password.
+Use the REPL to store a settings.toml file with the SSID, Wifi password, and web API password OR use an editor that supports editing files over serial like Thonny.
 
 Get the IP on the REPL with 
 
@@ -31,3 +31,21 @@ Get the IP on the REPL with
 print("My IP address is", wifi.radio.ipv4_address)'
 
 Point your web browser to that ip/code
+
+### MLX90640 
+
+Get the library bundle, install adafruit_mlx90640.mpy and adafruit_bus_device into the lib directory using the web workflow
+
+https://circuitpython.org/libraries
+
+https://learn.adafruit.com/adafruit-mlx90640-ir-thermal-camera/python-circuitpython
+
+i2c scanner for testing
+
+https://learn.adafruit.com/scanning-i2c-addresses/circuitpython
+
+The api server script uses flask and requires flask and flask-cors to be installed in the virtualenv. 
+
+Edit the mlx90640_uploader.py script with the IP or domain of the server to upload temperature values. Use a browser to access the server.
+
+
