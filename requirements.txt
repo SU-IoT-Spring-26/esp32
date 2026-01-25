@@ -1,2 +1,10 @@
+# Flask web server dependencies
 flask>=2.0.0
 flask-cors>=3.0.0
+
+# Scientific computing for occupancy estimation
+numpy>=1.20.0
+scipy>=1.7.0
+
+# HTTP client for occupancy estimator script
+requests>=2.25.0

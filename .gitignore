@@ -65,6 +65,9 @@ db.sqlite3-journal
 instance/
 .webassets-cache
 
+# Thermal camera data
+thermal_data/
+
 # Scrapy stuff:
 .scrapy
 
