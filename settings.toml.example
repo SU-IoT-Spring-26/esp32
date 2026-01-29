@@ -1,8 +1,12 @@
 # WiFi Configuration for CircuitPython
-# Copy this file to settings.toml on your CIRCUITPY drive and fill in your credentials
+# Copy this file to settings.toml on the CIRCUITPY device and fill in your credentials
 
-CIRCUITPY_WIFI_SSID = "AirOrangeX"
-# CIRCUITPY_WIFI_PASSWORD = ""
+WIFI_SSID = "AirOrangeX"
+# WIFI_PASSWORD = ""
+
+# Using CIRCUITPY_WIFI_PASSWORD and SSID will autostart the web workflow
+# we can save ~40KB of RAM by not autostarting it simply by using variables
+# without the CIRCUITPY prefix
 
 # Optional: Configure CircuitPython web workflow port (default is 80)
 # CIRCUITPY_WEB_API_PORT = 80

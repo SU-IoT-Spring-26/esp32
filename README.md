@@ -48,4 +48,30 @@ The api server script uses flask and requires flask and flask-cors to be install
 
 Edit the mlx90640_uploader.py script with the IP or domain of the server to upload temperature values. Use a browser to access the server.
 
+### Disable web workflow 
+the web workflow can be disabled to save resouces by removing CIRCUITPY_WIFI_SSID and CIRCUITPY_WIFI_PASSWORD from settings.toml and using different variables os.getenv() to connect. This saves ~40KB of RAM
+
+### Occupancy Estimation
+
+The `occupancy_estimator.py` script analyzes thermal images to detect and count people in a room. It requires additional dependencies:
+
+```bash
+pip install -r requirements.txt
+```
+
+Run a single analysis:
+```bash
+python3 occupancy_estimator.py
+```
+
+Run continuous monitoring:
+```bash
+python3 occupancy_estimator.py --continuous
+```
+
+The script fetches thermal data from the API server and uses temperature thresholds and connected component analysis to detect warm bodies (people). Adjust the detection parameters at the top of the script:
+- `MIN_HUMAN_TEMP` / `MAX_HUMAN_TEMP`: Temperature range for human detection
+- `MIN_CLUSTER_SIZE` / `MAX_CLUSTER_SIZE`: Size constraints for person clusters
+- `ROOM_TEMP_THRESHOLD`: Temperature difference from room temp to consider as person
+
 

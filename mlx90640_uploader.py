@@ -62,8 +62,8 @@ gc.collect()
 
 # WiFi configuration
 gc.collect()
-ssid = os.getenv("CIRCUITPY_WIFI_SSID")
-password = os.getenv("CIRCUITPY_WIFI_PASSWORD")
+ssid = os.getenv("WIFI_SSID")
+password = os.getenv("WIFI_PASSWORD")
 
 if not ssid or not password:
     raise ValueError("WiFi credentials not found in settings.toml")
