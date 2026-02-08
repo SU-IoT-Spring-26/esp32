@@ -184,32 +184,44 @@ def estimate_occupancy(thermal_data):
             'error': str(e)
         }
 
-def save_thermal_data(compact_data, expanded_data):
+def _sanitize_sensor_id_for_filename(sensor_id):
+    """Make sensor_id safe for use in filenames (alphanumeric and underscores only)."""
+    if not sensor_id:
+        return "unknown"
+    return "".join(c if c.isalnum() or c in "-_" else "_" for c in str(sensor_id))[:64]
+
+
+def save_thermal_data(compact_data, expanded_data, sensor_id=None):
     """Save thermal data to disk."""
     global _data_counter
     
     if not SAVE_DATA:
         return
     
+    sid = sensor_id or compact_data.get("sensor_id") or "unknown"
+    safe_id = _sanitize_sensor_id_for_filename(sid)
+    
     try:
         timestamp = datetime.now()
         timestamp_str = timestamp.strftime('%Y%m%d_%H%M%S_%f')[:-3]  # Include milliseconds
         
         # Save compact format (original, smaller file)
-        compact_filename = DATA_DIR / f"thermal_{timestamp_str}_compact.json"
+        compact_filename = DATA_DIR / f"thermal_{safe_id}_{timestamp_str}_compact.json"
         with open(compact_filename, 'w') as f:
             json.dump({
                 "timestamp": timestamp.isoformat(),
                 "format": "compact",
+                "sensor_id": sid,
                 "data": compact_data
             }, f, indent=2)
         
         # Save expanded format (with color data, for analysis)
-        expanded_filename = DATA_DIR / f"thermal_{timestamp_str}_expanded.json"
+        expanded_filename = DATA_DIR / f"thermal_{safe_id}_{timestamp_str}_expanded.json"
         with open(expanded_filename, 'w') as f:
             json.dump({
                 "timestamp": timestamp.isoformat(),
                 "format": "expanded",
+                "sensor_id": sid,
                 "data": expanded_data
             }, f, indent=2)
         
@@ -249,8 +261,10 @@ def save_occupancy_data(occupancy_result):
         occupancy_log_file = DATA_DIR / f"occupancy_{date_str}.jsonl"
         
         # Convert numpy types to native Python types for JSON serialization
+        sensor_id = occupancy_result.get("sensor_id") or "unknown"
         occupancy_entry = {
             "timestamp": timestamp.isoformat(),
+            "sensor_id": sensor_id,
             "occupancy": int(occupancy_result['occupancy']),
             "room_temperature": float(occupancy_result.get('room_temperature')) if occupancy_result.get('room_temperature') is not None else None,
             "people_clusters": convert_numpy_types(occupancy_result.get('people_clusters', []))
@@ -286,29 +300,32 @@ def receive_thermal_data():
         
         # Store original compact data for saving
         compact_data = data.copy()
+        sensor_id = data.get("sensor_id") or "unknown"
         
         # Expand compact data format into full format for web display
         if 't' in data:  # Compact format from ESP32
             try:
                 expanded_data = expand_thermal_data(data)
+                expanded_data["sensor_id"] = sensor_id
                 latest_thermal_data = expanded_data
                 print(f"Expanded to {len(expanded_data.get('pixels', []))} pixels")
             except Exception as e:
                 print(f"Error expanding data: {e}")
                 return jsonify({"error": f"Data expansion failed: {e}"}), 500
         else:  # Full format (backwards compatible)
-            latest_thermal_data = data
-            expanded_data = data
+            latest_thermal_data = data if data.get("sensor_id") else {**data, "sensor_id": sensor_id}
+            expanded_data = latest_thermal_data
         
         # Estimate occupancy
         occupancy_result = estimate_occupancy(data)
+        occupancy_result["sensor_id"] = sensor_id
         latest_occupancy = occupancy_result
-        print(f"Occupancy estimate: {occupancy_result['occupancy']} person(s)")
+        print(f"Occupancy estimate: {occupancy_result['occupancy']} person(s) [sensor_id={sensor_id}]")
         
         last_update_time = datetime.now().isoformat()
         
         # Save to disk
-        save_thermal_data(compact_data, expanded_data)
+        save_thermal_data(compact_data, expanded_data, sensor_id)
         save_occupancy_data(occupancy_result)
         
         pixel_count = len(latest_thermal_data.get('pixels', []))
@@ -383,6 +400,9 @@ def index():
         <div style="font-size: 14px; color: #aaa; margin-bottom: 10px;">
             Room Temp: <span id="roomTemp">--</span>°C
         </div>
+        <div style="font-size: 12px; color: #888; margin-bottom: 5px;">
+            Sensor: <span id="sensorId">--</span>
+        </div>
         <div class="status" id="status">Waiting for data...</div>
     </div>
     <canvas id="thermalCanvas" width="320" height="240"></canvas>
@@ -438,6 +458,9 @@ def index():
                     } else {
                         document.getElementById('roomTemp').textContent = '--';
                     }
+                    
+                    // Update sensor ID
+                    document.getElementById('sensorId').textContent = data.sensor_id || '--';
                     
                     if (data.last_update) {
                         const updateTime = new Date(data.last_update).toLocaleTimeString();
@@ -577,10 +600,11 @@ def test_endpoint():
 
 @app.route('/api/occupancy/history', methods=['GET'])
 def get_occupancy_history():
-    """Get historical occupancy data."""
+    """Get historical occupancy data. Optional query: sensor_id to filter by sensor."""
     try:
         # Get date parameter (default to today)
         date_str = request.args.get('date', datetime.now().strftime('%Y%m%d'))
+        filter_sensor_id = request.args.get('sensor_id')
         occupancy_log_file = DATA_DIR / f"occupancy_{date_str}.jsonl"
         
         if not occupancy_log_file.exists():
@@ -591,10 +615,13 @@ def get_occupancy_history():
         with open(occupancy_log_file, 'r') as f:
             for line in f:
                 if line.strip():
-                    occupancy_data.append(json.loads(line))
+                    entry = json.loads(line)
+                    if filter_sensor_id is None or entry.get("sensor_id") == filter_sensor_id:
+                        occupancy_data.append(entry)
         
         return jsonify({
             "date": date_str,
+            "sensor_id": filter_sensor_id,
             "count": len(occupancy_data),
             "data": occupancy_data
         }), 200
@@ -604,10 +631,11 @@ def get_occupancy_history():
 
 @app.route('/api/occupancy/stats', methods=['GET'])
 def get_occupancy_stats():
-    """Get occupancy statistics for a date."""
+    """Get occupancy statistics for a date. Optional query: sensor_id to filter by sensor."""
     try:
         # Get date parameter (default to today)
         date_str = request.args.get('date', datetime.now().strftime('%Y%m%d'))
+        filter_sensor_id = request.args.get('sensor_id')
         occupancy_log_file = DATA_DIR / f"occupancy_{date_str}.jsonl"
         
         if not occupancy_log_file.exists():
@@ -619,7 +647,8 @@ def get_occupancy_stats():
             for line in f:
                 if line.strip():
                     entry = json.loads(line)
-                    occupancy_values.append(entry['occupancy'])
+                    if filter_sensor_id is None or entry.get("sensor_id") == filter_sensor_id:
+                        occupancy_values.append(entry['occupancy'])
         
         if not occupancy_values:
             return jsonify({"error": "No occupancy data available"}), 404
@@ -627,6 +656,7 @@ def get_occupancy_stats():
         # Calculate statistics
         stats = {
             "date": date_str,
+            "sensor_id": filter_sensor_id,
             "total_readings": len(occupancy_values),
             "min_occupancy": min(occupancy_values),
             "max_occupancy": max(occupancy_values),
@@ -647,9 +677,10 @@ if __name__ == '__main__':
     print("=" * 60)
     print("Thermal Camera API Server")
     print("=" * 60)
-    print("API endpoint: http://0.0.0.0:5000/api/thermal")
-    print("Test endpoint: http://0.0.0.0:5000/api/test")
-    print("Web interface: http://localhost:5000")
+    port = int(os.environ.get('PORT', 5000))
+    print(f"API endpoint: http://0.0.0.0:{port}/api/thermal")
+    print(f"Test endpoint: http://0.0.0.0:{port}/api/test")
+    print(f"Web interface: http://localhost:{port}")
     if SAVE_DATA:
         print(f"Data storage: ENABLED ({DATA_DIR.absolute()})")
     else:
@@ -657,5 +688,5 @@ if __name__ == '__main__':
     print("=" * 60)
     print("\nWaiting for ESP32 to send thermal data...\n")
     
-    # Run on all interfaces so ESP32 can connect
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    # Run on all interfaces so ESP32 can connect. Use PORT from env (e.g. Azure).
+    app.run(host='0.0.0.0', port=port, debug=True)

@@ -27,6 +27,9 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 # Get your laptop's IP with: ip addr show (Linux) or ipconfig (Windows)
 API_URL = "http://10.0.0.111:5000/api/thermal"  # Change to your laptop's IP
 
+# Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
+SENSOR_ID = os.getenv("SENSOR_ID", "default")
+
 # Upload rate - how often to send thermal data to the API (in seconds)
 UPLOAD_INTERVAL = 3.0  # Adjust this value to change upload frequency
 
@@ -84,8 +87,9 @@ def generate_thermal_json(frame_data):
     max_temp = max(frame_data)
     
     # Build JSON string directly without creating intermediate lists
-    # This is more memory efficient
-    json_str = '{"w":' + str(MLX_SHAPE[1])
+    # This is more memory efficient. Include sensor_id for multi-sensor support.
+    json_str = '{"sensor_id":"' + SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"') + '"'
+    json_str += ',"w":' + str(MLX_SHAPE[1])
     json_str += ',"h":' + str(MLX_SHAPE[0])
     json_str += ',"min":' + str(round(min_temp, 1))
     json_str += ',"max":' + str(round(max_temp, 1))
