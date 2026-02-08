@@ -25,7 +25,7 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 
 # API configuration - modify this to match your laptop's IP address
 # Get your laptop's IP with: ip addr show (Linux) or ipconfig (Windows)
-API_URL = "https://occupancy-api-b8hcb8hyh7f7aph3.canadacentral-01.azurewebsites.net/api/thermal" # http://10.0.0.111:5000/api/thermal"
+API_URL = "http://occupancy-api-b8hcb8hyh7f7aph3.canadacentral-01.azurewebsites.net/api/thermal" # http://10.0.0.111:5000/api/thermal"
 
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
