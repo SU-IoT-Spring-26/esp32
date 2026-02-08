@@ -63,5 +63,4 @@ jobs:
         with:
           app-name: 'occupancy-api'
           slot-name: 'Production'
-          publish-profile: ${{ secrets.__publishingprofilesecretname__ }}
-
+          publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_2F739E1489A7443B841D1634A1AD58F3 }}
