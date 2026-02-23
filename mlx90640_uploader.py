@@ -25,7 +25,7 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 
 # API configuration - modify this to match your laptop's IP address
 # Get your laptop's IP with: ip addr show (Linux) or ipconfig (Windows)
-API_URL = 'https://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
+API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
 
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
@@ -66,9 +66,10 @@ gc.collect()
 # WiFi configuration
 gc.collect()
 ssid = os.getenv("WIFI_SSID")
-password = os.getenv("WIFI_PASSWORD")
+# SU wifi does not need a password
+password = os.getenv("WIFI_PASSWORD") 
 
-if not ssid or not password:
+if not ssid and not password:
     raise ValueError("WiFi credentials not found in settings.toml")
 
 wifi.radio.connect(ssid=ssid, password=password)
@@ -106,15 +107,23 @@ def upload_thermal_data(json_data):
     """Upload thermal data to API server via HTTP POST."""
     try:
         # Parse URL
+        is_https = False
+        url_part = API_URL
         if API_URL.startswith("http://"):
             url_part = API_URL[7:]
-        else:
-            url_part = API_URL
+        elif API_URL.startswith("https://"):
+            url_part = API_URL[8:]
+            is_https = True
         
         parts = url_part.split('/')
         host_port = parts[0].split(':')
         host = host_port[0]
-        port = int(host_port[1]) if len(host_port) > 1 else 80
+        if len(host_port) > 1 and host_port[1]:
+            port = int(host_port[1])
+        else:
+            # Default ports for HTTP/HTTPS. Note: connection is plain TCP; HTTPS
+            # would require additional TLS handling which is not implemented here.
+            port = 443 if is_https else 80
         path = '/' + '/'.join(parts[1:]) if len(parts) > 1 else '/'
         
         # Create socket connection
