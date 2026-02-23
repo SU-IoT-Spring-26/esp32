@@ -31,7 +31,7 @@ API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azur
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
 
 # Upload rate - how often to send thermal data to the API (in seconds)
-UPLOAD_INTERVAL = 3.0  # Adjust this value to change upload frequency
+UPLOAD_INTERVAL = 6.0  # Adjust this value to change upload frequency
 
 # Initialize I2C bus
 gc.collect()
@@ -81,11 +81,48 @@ gc.collect()
 
 # Color mapping moved to server to save ESP32 memory
 
+INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
+
+
+def sanitize_frame(frame_data):
+    """Return a new list where invalid pixels are replaced by the minimum valid temperature.
+
+    This avoids uploading impossible values like -273.15°C while preserving shape.
+    """
+    # Collect valid temps
+    valid = []
+    for v in frame_data:
+        if v is not None and v > INVALID_TEMP_THRESHOLD:
+            valid.append(v)
+    if not valid:
+        # If everything looks invalid, replace with a safe constant so logs and uploads
+        # never show impossible values like -273.15°C.
+        return [0.0] * len(frame_data)
+    min_valid = min(valid)
+    sanitized = []
+    for v in frame_data:
+        if v is None or v <= INVALID_TEMP_THRESHOLD:
+            sanitized.append(min_valid)
+        else:
+            sanitized.append(v)
+    return sanitized
+
+
 def generate_thermal_json(frame_data):
     """Generate minimal JSON with just raw temperature data - very memory efficient."""
-    # Calculate min/max for the server to use
-    min_temp = min(frame_data)
-    max_temp = max(frame_data)
+    # Calculate min/max for the server to use, ignoring invalid pixels
+    min_temp = 999.0
+    max_temp = -999.0
+    for v in frame_data:
+        if v is not None and v > INVALID_TEMP_THRESHOLD:
+            if v < min_temp:
+                min_temp = v
+            if v > max_temp:
+                max_temp = v
+    # Fallback if everything was invalid
+    if min_temp == 999.0 or max_temp == -999.0:
+        min_temp = 0.0
+        max_temp = 0.0
     
     # Build JSON string directly without creating intermediate lists
     # This is more memory efficient. Include sensor_id for multi-sensor support.
@@ -232,15 +269,18 @@ while True:
         # Generate JSON
         gc.collect()
         try:
-            json_data = generate_thermal_json(frame)
+            # Sanitize frame so we don't upload impossible values like -273.15°C
+            sanitized_frame = sanitize_frame(frame)
+            json_data = generate_thermal_json(sanitized_frame)
         except Exception as e:
             print(f"Error generating JSON: {e}")
             time.sleep(UPLOAD_INTERVAL)
             continue
         
         # Upload to API
-        min_temp = min(frame)
-        max_temp = max(frame)
+        # Use sanitized values for logging so min is realistic
+        min_temp = min(sanitized_frame)
+        max_temp = max(sanitized_frame)
         if upload_thermal_data(json_data):
             upload_count += 1
             print(f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C")
