@@ -5,7 +5,6 @@ Upload interval is configurable via UPLOAD_INTERVAL variable
 """
 
 import time
-import json
 import os
 import gc
 gc.collect()
@@ -26,6 +25,16 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 # API configuration - modify this to match your laptop's IP address
 # Get your laptop's IP with: ip addr show (Linux) or ipconfig (Windows)
 API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
+
+# Pre-parse API_URL once so upload_thermal_data doesn't repeat this on every upload
+_url_no_scheme = API_URL[7:] if API_URL.startswith("http://") else API_URL[8:]
+_is_https = API_URL.startswith("https://")
+_url_parts = _url_no_scheme.split('/')
+_host_port = _url_parts[0].split(':')
+API_HOST = _host_port[0]
+API_PORT = int(_host_port[1]) if len(_host_port) > 1 and _host_port[1] else (443 if _is_https else 80)
+API_PATH = '/' + '/'.join(_url_parts[1:]) if len(_url_parts) > 1 else '/'
+del _url_no_scheme, _is_https, _url_parts, _host_port
 
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
@@ -69,7 +78,7 @@ ssid = os.getenv("WIFI_SSID")
 # SU wifi does not need a password
 password = os.getenv("WIFI_PASSWORD") 
 
-if not ssid and not password:
+if not ssid:
     raise ValueError("WiFi credentials not found in settings.toml")
 
 wifi.radio.connect(ssid=ssid, password=password)
@@ -124,45 +133,31 @@ def generate_thermal_json(frame_data):
         min_temp = 0.0
         max_temp = 0.0
     
-    # Build JSON string directly without creating intermediate lists
-    # This is more memory efficient. Include sensor_id for multi-sensor support.
-    json_str = '{"sensor_id":"' + SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"') + '"'
-    json_str += ',"w":' + str(MLX_SHAPE[1])
-    json_str += ',"h":' + str(MLX_SHAPE[0])
-    json_str += ',"min":' + str(round(min_temp, 1))
-    json_str += ',"max":' + str(round(max_temp, 1))
-    json_str += ',"t":[' + str(round(frame_data[0], 1))
-    
-    # Add remaining temperatures one at a time
+    # Build JSON using a list of parts then join once at the end.
+    # Repeated string += in a loop creates a new object each iteration,
+    # fragmenting the heap over time. A single join allocates one final string.
+    parts = ['{"sensor_id":"', SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"'), '"']
+    parts.append(',"w":')
+    parts.append(str(MLX_SHAPE[1]))
+    parts.append(',"h":')
+    parts.append(str(MLX_SHAPE[0]))
+    parts.append(',"min":')
+    parts.append(str(round(min_temp, 1)))
+    parts.append(',"max":')
+    parts.append(str(round(max_temp, 1)))
+    parts.append(',"t":[')
+    parts.append(str(round(frame_data[0], 1)))
     for i in range(1, len(frame_data)):
-        json_str += ',' + str(round(frame_data[i], 1))
-    
-    json_str += ']}'
-    return json_str
+        parts.append(',')
+        parts.append(str(round(frame_data[i], 1)))
+    parts.append(']}')
+    return ''.join(parts)
 
 def upload_thermal_data(json_data):
     """Upload thermal data to API server via HTTP POST."""
     try:
-        # Parse URL
-        is_https = False
-        url_part = API_URL
-        if API_URL.startswith("http://"):
-            url_part = API_URL[7:]
-        elif API_URL.startswith("https://"):
-            url_part = API_URL[8:]
-            is_https = True
-        
-        parts = url_part.split('/')
-        host_port = parts[0].split(':')
-        host = host_port[0]
-        if len(host_port) > 1 and host_port[1]:
-            port = int(host_port[1])
-        else:
-            # Default ports for HTTP/HTTPS. Note: connection is plain TCP; HTTPS
-            # would require additional TLS handling which is not implemented here.
-            port = 443 if is_https else 80
-        path = '/' + '/'.join(parts[1:]) if len(parts) > 1 else '/'
-        
+        host, port, path = API_HOST, API_PORT, API_PATH
+
         # Create socket connection
         try:
             socket = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
@@ -235,6 +230,20 @@ def upload_thermal_data(json_data):
         print(f"Upload error: {e}")
         return False
 
+def ensure_wifi_connected():
+    """Reconnect to WiFi if the connection has dropped. Returns True if connected."""
+    if wifi.radio.connected:
+        return True
+    print("WiFi disconnected, reconnecting...")
+    try:
+        wifi.radio.connect(ssid=ssid, password=password)
+        print(f"Reconnected: {wifi.radio.ipv4_address}")
+        return True
+    except Exception as e:
+        print(f"WiFi reconnect failed: {e}")
+        return False
+
+
 # Main loop
 print(f"Connected to WiFi: {ip_addr}")
 print(f"API server: {API_URL}")
@@ -251,7 +260,11 @@ while True:
             print("Sensor not available, waiting...")
             time.sleep(UPLOAD_INTERVAL)
             continue
-        
+
+        if not ensure_wifi_connected():
+            time.sleep(UPLOAD_INTERVAL)
+            continue
+
         # Read thermal frame
         gc.collect()
         try:
@@ -281,6 +294,7 @@ while True:
         # Use sanitized values for logging so min is realistic
         min_temp = min(sanitized_frame)
         max_temp = max(sanitized_frame)
+        del sanitized_frame
         if upload_thermal_data(json_data):
             upload_count += 1
             print(f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C")
