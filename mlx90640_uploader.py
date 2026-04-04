@@ -81,7 +81,21 @@ password = os.getenv("WIFI_PASSWORD")
 if not ssid:
     raise ValueError("WiFi credentials not found in settings.toml")
 
-wifi.radio.connect(ssid=ssid, password=password)
+wifi.radio.enabled = True
+for attempt in range(5):
+    try:
+        if password:
+            wifi.radio.connect(ssid=ssid, password=password)
+        else:
+            wifi.radio.connect(ssid=ssid)
+        break
+    except ConnectionError as e:
+        print(f"WiFi attempt {attempt + 1} failed: {e}")
+        if attempt < 4:
+            time.sleep(2)
+else:
+    raise ConnectionError("Failed to connect after 5 attempts")
+
 ip_addr = wifi.radio.ipv4_address
 gc.collect()
 
@@ -133,25 +147,27 @@ def generate_thermal_json(frame_data):
         min_temp = 0.0
         max_temp = 0.0
     
-    # Build JSON using a list of parts then join once at the end.
-    # Repeated string += in a loop creates a new object each iteration,
-    # fragmenting the heap over time. A single join allocates one final string.
-    parts = ['{"sensor_id":"', SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"'), '"']
-    parts.append(',"w":')
-    parts.append(str(MLX_SHAPE[1]))
-    parts.append(',"h":')
-    parts.append(str(MLX_SHAPE[0]))
-    parts.append(',"min":')
-    parts.append(str(round(min_temp, 1)))
-    parts.append(',"max":')
-    parts.append(str(round(max_temp, 1)))
-    parts.append(',"t":[')
-    parts.append(str(round(frame_data[0], 1)))
+    # Build JSON into a bytearray: mutable, grows in-place, no per-value string
+    # object overhead. The old list+join approach created ~1500 small objects,
+    # fragmenting the heap until the final join failed to find a contiguous block.
+    safe_id = SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"')
+    buf = bytearray(b'{"sensor_id":"')
+    buf += safe_id.encode('utf-8')
+    buf += b'","w":'
+    buf += str(MLX_SHAPE[1]).encode()
+    buf += b',"h":'
+    buf += str(MLX_SHAPE[0]).encode()
+    buf += b',"min":'
+    buf += str(round(min_temp, 1)).encode()
+    buf += b',"max":'
+    buf += str(round(max_temp, 1)).encode()
+    buf += b',"t":['
+    buf += str(round(frame_data[0], 1)).encode()
     for i in range(1, len(frame_data)):
-        parts.append(',')
-        parts.append(str(round(frame_data[i], 1)))
-    parts.append(']}')
-    return ''.join(parts)
+        buf += b','
+        buf += str(round(frame_data[i], 1)).encode()
+    buf += b']}'
+    return buf
 
 def upload_thermal_data(json_data):
     """Upload thermal data to API server via HTTP POST."""
@@ -165,11 +181,11 @@ def upload_thermal_data(json_data):
             socket = pool.socket()
         
         try:
-            socket.settimeout(10.0)
+            socket.setblocking(True)
             socket.connect((host, port))
             
             # Prepare HTTP POST request
-            json_bytes = json_data.encode('utf-8')
+            json_bytes = json_data  # already a bytearray from generate_thermal_json
             request = f"POST {path} HTTP/1.1\r\n"
             request += f"Host: {host}:{port}\r\n"
             request += "Content-Type: application/json\r\n"
@@ -236,7 +252,10 @@ def ensure_wifi_connected():
         return True
     print("WiFi disconnected, reconnecting...")
     try:
-        wifi.radio.connect(ssid=ssid, password=password)
+        if password:
+            wifi.radio.connect(ssid=ssid, password=password)
+        else:
+            wifi.radio.connect(ssid=ssid)
         print(f"Reconnected: {wifi.radio.ipv4_address}")
         return True
     except Exception as e:
