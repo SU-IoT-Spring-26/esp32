@@ -113,57 +113,45 @@ def temperature_to_color(temp, min_temp=20, max_temp=40):
 def generate_thermal_image_json(frame_data, min_temp=None, max_temp=None):
     """
     Generate JSON representation of thermal image with color data.
-    Returns JSON string with pixel colors and temperature values.
-    Memory-optimized version for ESP32.
+    Returns bytearray to avoid heap fragmentation from thousands of small string objects.
     """
     if min_temp is None:
         min_temp = min(frame_data)
     if max_temp is None:
         max_temp = max(frame_data)
-    
-    # Build JSON string directly to avoid large dictionary in memory
-    # This is more memory-efficient than building a dict then converting
-    json_parts = []
-    json_parts.append('{"width":')
-    json_parts.append(str(MLX_SHAPE[1]))
-    json_parts.append(',"height":')
-    json_parts.append(str(MLX_SHAPE[0]))
-    json_parts.append(',"min_temp":')
-    json_parts.append(str(round(min_temp, 2)))
-    json_parts.append(',"max_temp":')
-    json_parts.append(str(round(max_temp, 2)))
-    json_parts.append(',"pixels":[')
-    
-    # Add pixels one at a time to reduce memory usage
-    first_pixel = True
+
+    buf = bytearray(b'{"width":')
+    buf += str(MLX_SHAPE[1]).encode()
+    buf += b',"height":'
+    buf += str(MLX_SHAPE[0]).encode()
+    buf += b',"min_temp":'
+    buf += str(round(min_temp, 2)).encode()
+    buf += b',"max_temp":'
+    buf += str(round(max_temp, 2)).encode()
+    buf += b',"pixels":['
+
     for i, temp in enumerate(frame_data):
-        if not first_pixel:
-            json_parts.append(',')
-        first_pixel = False
-        
+        if i > 0:
+            buf += b','
         row = i // MLX_SHAPE[1]
         col = i % MLX_SHAPE[1]
         r, g, b = temperature_to_color(temp, min_temp, max_temp)
-        
-        # Build pixel JSON directly
-        json_parts.append('{"row":')
-        json_parts.append(str(row))
-        json_parts.append(',"col":')
-        json_parts.append(str(col))
-        json_parts.append(',"temp":')
-        json_parts.append(str(round(temp, 2)))
-        json_parts.append(',"r":')
-        json_parts.append(str(r))
-        json_parts.append(',"g":')
-        json_parts.append(str(g))
-        json_parts.append(',"b":')
-        json_parts.append(str(b))
-        json_parts.append('}')
-    
-    json_parts.append(']}')
-    
-    # Join all parts into final JSON string
-    return ''.join(json_parts)
+        buf += b'{"row":'
+        buf += str(row).encode()
+        buf += b',"col":'
+        buf += str(col).encode()
+        buf += b',"temp":'
+        buf += str(round(temp, 2)).encode()
+        buf += b',"r":'
+        buf += str(r).encode()
+        buf += b',"g":'
+        buf += str(g).encode()
+        buf += b',"b":'
+        buf += str(b).encode()
+        buf += b'}'
+
+    buf += b']}'
+    return buf
 
 # Encoded once at startup — never changes, no need to rebuild or re-encode per request
 HTML_PAGE = """<!DOCTYPE html>
@@ -399,9 +387,7 @@ def handle_request(client_socket):
                     
                     if frame_read_success:
                         gc.collect()
-                        json_data = generate_thermal_image_json(frame)
-                        json_bytes = json_data.encode('utf-8')
-                        del json_data
+                        json_bytes = generate_thermal_image_json(frame)
                         gc.collect()
                         
                         response_headers = f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {len(json_bytes)}\r\nConnection: close\r\n\r\n"
@@ -483,7 +469,7 @@ while True:
         client_socket, addr = server_socket.accept()
         handle_request(client_socket)
         gc.collect()
-    except Exception:
+    except Exception as e:
         if not wifi.radio.connected:
             print("WiFi disconnected, reconnecting...")
             try:
@@ -514,6 +500,7 @@ while True:
                 print(f"WiFi reconnect failed: {e}")
                 time.sleep(5.0)
         else:
+            print(f"Accept error (WiFi connected): {e}")
             time.sleep(0.1)
 
 

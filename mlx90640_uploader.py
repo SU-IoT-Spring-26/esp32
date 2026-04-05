@@ -104,6 +104,9 @@ gc.collect()
 
 # Color mapping moved to server to save ESP32 memory
 
+# Allocated once to avoid repeated heap churn on every upload
+_response_buffer = bytearray(512)
+
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
 
@@ -181,7 +184,7 @@ def upload_thermal_data(json_data):
             socket = pool.socket()
         
         try:
-            socket.setblocking(True)
+            socket.settimeout(15.0)
             socket.connect((host, port))
             
             # Prepare HTTP POST request
@@ -213,11 +216,10 @@ def upload_thermal_data(json_data):
                 total_sent += sent
             
             # Read response to verify
-            response_buffer = bytearray(512)
             try:
-                bytes_read = socket.recv_into(response_buffer, 512)
+                bytes_read = socket.recv_into(_response_buffer, 512)
                 # Check if response indicates success (200 OK)
-                response_str = response_buffer[:bytes_read].decode('utf-8', errors='ignore')
+                response_str = _response_buffer[:bytes_read].decode('utf-8', errors='ignore')
                 if '200' in response_str or 'success' in response_str.lower():
                     return True
             except:
@@ -248,6 +250,7 @@ def upload_thermal_data(json_data):
 
 def ensure_wifi_connected():
     """Reconnect to WiFi if the connection has dropped. Returns True if connected."""
+    global pool
     if wifi.radio.connected:
         return True
     print("WiFi disconnected, reconnecting...")
@@ -256,6 +259,7 @@ def ensure_wifi_connected():
             wifi.radio.connect(ssid=ssid, password=password)
         else:
             wifi.radio.connect(ssid=ssid)
+        pool = socketpool.SocketPool(wifi.radio)
         print(f"Reconnected: {wifi.radio.ipv4_address}")
         return True
     except Exception as e:
@@ -273,6 +277,9 @@ if mlx is None:
     print("Script will run but no data will be uploaded")
 
 upload_count = 0
+sensor_fail_count = 0
+MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
+
 while True:
     try:
         if mlx is None:
@@ -288,13 +295,27 @@ while True:
         gc.collect()
         try:
             mlx.getFrame(frame)
+            sensor_fail_count = 0
         except MemoryError:
             print("Memory error reading frame, retrying...")
             gc.collect()
             time.sleep(UPLOAD_INTERVAL)
             continue
         except Exception as e:
-            print(f"Error reading frame: {e}")
+            sensor_fail_count += 1
+            print(f"Error reading frame ({sensor_fail_count}/{MAX_SENSOR_FAILS}): {e}")
+            if sensor_fail_count >= MAX_SENSOR_FAILS:
+                print("Too many sensor failures, re-initializing MLX90640...")
+                sensor_fail_count = 0
+                try:
+                    gc.collect()
+                    mlx = adafruit_mlx90640.MLX90640(i2c)
+                    mlx.refresh_rate = RefreshRate.REFRESH_4_HZ
+                    gc.collect()
+                    print("Sensor re-initialized successfully")
+                except Exception as reinit_e:
+                    print(f"Sensor re-init failed: {reinit_e}")
+                    mlx = None
             time.sleep(UPLOAD_INTERVAL)
             continue
         
