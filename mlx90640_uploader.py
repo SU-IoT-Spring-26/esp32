@@ -31,24 +31,16 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
 
 # Pre-parse API_URL once so upload_thermal_data doesn't repeat this on every upload.
-# Only http:// and https:// are supported; scheme-less "host/path" uses http on port 80.
-if API_URL.startswith("https://"):
-    _url_no_scheme = API_URL[8:]
-    _is_https = True
-elif API_URL.startswith("http://"):
-    _url_no_scheme = API_URL[7:]
-    _is_https = False
-else:
-    if "://" in API_URL:
-        raise ValueError("API_URL must use http:// or https:// (other schemes not supported)")
-    _url_no_scheme = API_URL
-    _is_https = False
+# API is always plain HTTP (not TLS on the device).
+if not API_URL.startswith("http://"):
+    raise ValueError("API_URL must start with http://")
+_url_no_scheme = API_URL[7:]
 _url_parts = _url_no_scheme.split('/')
 _host_port = _url_parts[0].split(':')
 API_HOST = _host_port[0]
-API_PORT = int(_host_port[1]) if len(_host_port) > 1 and _host_port[1] else (443 if _is_https else 80)
+API_PORT = int(_host_port[1]) if len(_host_port) > 1 and _host_port[1] else 80
 API_PATH = '/' + '/'.join(_url_parts[1:]) if len(_url_parts) > 1 else '/'
-del _url_no_scheme, _is_https, _url_parts, _host_port
+del _url_no_scheme, _url_parts, _host_port
 
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
