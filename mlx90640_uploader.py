@@ -1,7 +1,11 @@
 """
 ESP32 CircuitPython Thermal Camera Data Uploader
-Reads thermal data from MLX90640 sensor and uploads to API server
-Upload interval is configurable via UPLOAD_INTERVAL variable
+Reads thermal data from MLX90640 sensor and uploads to API server.
+
+Poll interval: UPLOAD_INTERVAL. Uploads only when the sanitized frame differs from
+the last successful upload by at least MIN_MEAN_DELTA_C (mean absolute °C across
+pixels), unless MIN_MEAN_DELTA_C is 0 (upload every poll). At most MAX_UPLOADS_PER_HOUR
+uploads in any rolling 3600s window.
 """
 
 import time
@@ -26,9 +30,19 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 # Get your laptop's IP with: ip addr show (Linux) or ipconfig (Windows)
 API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
 
-# Pre-parse API_URL once so upload_thermal_data doesn't repeat this on every upload
-_url_no_scheme = API_URL[7:] if API_URL.startswith("http://") else API_URL[8:]
-_is_https = API_URL.startswith("https://")
+# Pre-parse API_URL once so upload_thermal_data doesn't repeat this on every upload.
+# Only http:// and https:// are supported; scheme-less "host/path" uses http on port 80.
+if API_URL.startswith("https://"):
+    _url_no_scheme = API_URL[8:]
+    _is_https = True
+elif API_URL.startswith("http://"):
+    _url_no_scheme = API_URL[7:]
+    _is_https = False
+else:
+    if "://" in API_URL:
+        raise ValueError("API_URL must use http:// or https:// (other schemes not supported)")
+    _url_no_scheme = API_URL
+    _is_https = False
 _url_parts = _url_no_scheme.split('/')
 _host_port = _url_parts[0].split(':')
 API_HOST = _host_port[0]
@@ -39,8 +53,18 @@ del _url_no_scheme, _is_https, _url_parts, _host_port
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
 
-# Upload rate - how often to send thermal data to the API (in seconds)
-UPLOAD_INTERVAL = 6.0  # Adjust this value to change upload frequency
+# How often to poll the sensor (seconds). Upload only runs when the frame changed
+# enough vs last successful upload (see MIN_MEAN_DELTA_C) and under hourly cap.
+UPLOAD_INTERVAL = 15.0
+
+# Only upload when mean |current − last_uploaded| across all pixels exceeds this (°C).
+# Reduces Azure requests when the scene is static. Set to 0 to upload every poll.
+MIN_MEAN_DELTA_C = 0.2
+
+# Rolling 1-hour cap on successful uploads (uses time.monotonic(), not wall clock).
+# Set to 0 to disable the cap.
+MAX_UPLOADS_PER_HOUR = 60
+RATE_LIMIT_WINDOW_S = 3600
 
 # Initialize I2C bus
 gc.collect()
@@ -108,6 +132,42 @@ gc.collect()
 _response_buffer = bytearray(512)
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
+
+
+def mean_abs_frame_diff(a, b):
+    """Mean absolute difference between two equal-length frames (°C)."""
+    total = 0.0
+    for i in range(FRAME_SIZE):
+        d = a[i] - b[i]
+        if d < 0:
+            d = -d
+        total += d
+    return total / FRAME_SIZE
+
+
+# Timestamps (time.monotonic()) of successful uploads for hourly rate limit
+_upload_times = []
+
+
+def _prune_upload_times():
+    """Drop upload times older than RATE_LIMIT_WINDOW_S."""
+    now = time.monotonic()
+    while _upload_times and (now - _upload_times[0]) > RATE_LIMIT_WINDOW_S:
+        _upload_times.pop(0)
+
+
+def upload_rate_under_cap():
+    """True if we have fewer than MAX_UPLOADS_PER_HOUR uploads in the last hour."""
+    if MAX_UPLOADS_PER_HOUR <= 0:
+        return True
+    _prune_upload_times()
+    return len(_upload_times) < MAX_UPLOADS_PER_HOUR
+
+
+def record_successful_upload():
+    if MAX_UPLOADS_PER_HOUR <= 0:
+        return
+    _upload_times.append(time.monotonic())
 
 
 def sanitize_frame(frame_data):
@@ -277,6 +337,9 @@ if mlx is None:
     print("Script will run but no data will be uploaded")
 
 upload_count = 0
+skip_count = 0
+hourly_cap_skips = 0
+last_uploaded_frame = None  # sanitized frame from last successful upload; None = always upload once
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
 
@@ -319,29 +382,60 @@ while True:
             time.sleep(UPLOAD_INTERVAL)
             continue
         
-        # Generate JSON
+        # Sanitize and decide whether scene changed vs last successful upload
         gc.collect()
         try:
-            # Sanitize frame so we don't upload impossible values like -273.15°C
             sanitized_frame = sanitize_frame(frame)
+        except Exception as e:
+            print(f"Error sanitizing frame: {e}")
+            time.sleep(UPLOAD_INTERVAL)
+            continue
+
+        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None:
+            delta = mean_abs_frame_diff(sanitized_frame, last_uploaded_frame)
+            if delta < MIN_MEAN_DELTA_C:
+                skip_count += 1
+                del sanitized_frame
+                gc.collect()
+                time.sleep(UPLOAD_INTERVAL)
+                continue
+
+        if MAX_UPLOADS_PER_HOUR > 0 and not upload_rate_under_cap():
+            hourly_cap_skips += 1
+            del sanitized_frame
+            gc.collect()
+            time.sleep(UPLOAD_INTERVAL)
+            continue
+
+        # Generate JSON and upload
+        gc.collect()
+        try:
             json_data = generate_thermal_json(sanitized_frame)
         except Exception as e:
             print(f"Error generating JSON: {e}")
+            del sanitized_frame
+            gc.collect()
             time.sleep(UPLOAD_INTERVAL)
             continue
-        
-        # Upload to API
-        # Use sanitized values for logging so min is realistic
+
         min_temp = min(sanitized_frame)
         max_temp = max(sanitized_frame)
-        del sanitized_frame
         if upload_thermal_data(json_data):
             upload_count += 1
-            print(f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C")
+            record_successful_upload()
+            last_uploaded_frame = sanitized_frame
+            msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
+            if skip_count:
+                msg += f" (skipped {skip_count} unchanged)"
+                skip_count = 0
+            if hourly_cap_skips:
+                msg += f" (hourly cap waited {hourly_cap_skips} polls)"
+                hourly_cap_skips = 0
+            print(msg)
         else:
             print(f"Upload failed: {min_temp:.1f}°C - {max_temp:.1f}°C")
-        
-        # Clean up
+            del sanitized_frame
+
         del json_data
         gc.collect()
         
