@@ -2,10 +2,9 @@
 ESP32 CircuitPython Thermal Camera Data Uploader
 Reads thermal data from MLX90640 sensor and uploads to API server.
 
-Poll interval: UPLOAD_INTERVAL. Uploads only when the sanitized frame differs from
-the last successful upload by at least MIN_MEAN_DELTA_C (mean absolute °C across
-pixels), unless MIN_MEAN_DELTA_C is 0 (upload every poll). At most MAX_UPLOADS_PER_HOUR
-uploads in any rolling 3600s window.
+Poll interval: UPLOAD_INTERVAL. When MIN_MEAN_DELTA_C > 0, uploads only if the
+sanitized frame differs from the last successful upload by at least that mean
+absolute °C across pixels. Set MIN_MEAN_DELTA_C to 0 to upload every poll.
 """
 
 import time
@@ -31,7 +30,7 @@ FRAME_SIZE = MLX_SHAPE[0] * MLX_SHAPE[1]  # 768 pixels
 API_URL = 'http://occupancy-api-container.yellowbush-1452fab1.canadacentral.azurecontainerapps.io/api/thermal'
 
 # Pre-parse API_URL once so upload_thermal_data doesn't repeat this on every upload.
-# API is always plain HTTP (not TLS on the device).
+# Plain HTTP only (this uploader does not use TLS on the device).
 if not API_URL.startswith("http://"):
     raise ValueError("API_URL must start with http://")
 _url_no_scheme = API_URL[7:]
@@ -42,21 +41,19 @@ API_PORT = int(_host_port[1]) if len(_host_port) > 1 and _host_port[1] else 80
 API_PATH = '/' + '/'.join(_url_parts[1:]) if len(_url_parts) > 1 else '/'
 del _url_no_scheme, _url_parts, _host_port
 
+# Cached IPv4 for connect(); HTTP Host: still uses API_HOST (hostname).
+API_RESOLVED_IP = None
+
 # Unique sensor ID - set in settings.toml so each device is identifiable (e.g. SENSOR_ID = "living-room")
 SENSOR_ID = os.getenv("SENSOR_ID", "default")
 
-# How often to poll the sensor (seconds). Upload only runs when the frame changed
-# enough vs last successful upload (see MIN_MEAN_DELTA_C) and under hourly cap.
+# How often to poll the sensor (seconds). Upload runs when the frame changed
+# enough vs last successful upload (see MIN_MEAN_DELTA_C), if enabled.
 UPLOAD_INTERVAL = 15.0
 
 # Only upload when mean |current − last_uploaded| across all pixels exceeds this (°C).
-# Reduces Azure requests when the scene is static. Set to 0 to upload every poll.
+# Reduces API traffic when the scene is static. Set to 0 to upload every poll.
 MIN_MEAN_DELTA_C = 0.2
-
-# Rolling 1-hour cap on successful uploads (uses time.monotonic(), not wall clock).
-# Set to 0 to disable the cap.
-MAX_UPLOADS_PER_HOUR = 60
-RATE_LIMIT_WINDOW_S = 3600
 
 # Initialize I2C bus
 gc.collect()
@@ -92,7 +89,7 @@ gc.collect()
 gc.collect()
 ssid = os.getenv("WIFI_SSID")
 # SU wifi does not need a password
-password = os.getenv("WIFI_PASSWORD") 
+password = os.getenv("WIFI_PASSWORD")
 
 if not ssid:
     raise ValueError("WiFi credentials not found in settings.toml")
@@ -118,6 +115,13 @@ gc.collect()
 pool = socketpool.SocketPool(wifi.radio)
 gc.collect()
 
+# Upload robustness (EAGAIN on send, flaky DNS)
+UPLOAD_MAX_ATTEMPTS = 3
+UPLOAD_RETRY_DELAY_S = 1.0
+SOCKET_TIMEOUT_S = 20.0
+_SEND_EAGAIN_MAX = 50
+_SEND_EAGAIN_SLEEP_S = 0.05
+
 # Color mapping moved to server to save ESP32 memory
 
 # Allocated once to avoid repeated heap churn on every upload
@@ -137,29 +141,59 @@ def mean_abs_frame_diff(a, b):
     return total / FRAME_SIZE
 
 
-# Timestamps (time.monotonic()) of successful uploads for hourly rate limit
-_upload_times = []
-
-
-def _prune_upload_times():
-    """Drop upload times older than RATE_LIMIT_WINDOW_S."""
-    now = time.monotonic()
-    while _upload_times and (now - _upload_times[0]) > RATE_LIMIT_WINDOW_S:
-        _upload_times.pop(0)
-
-
-def upload_rate_under_cap():
-    """True if we have fewer than MAX_UPLOADS_PER_HOUR uploads in the last hour."""
-    if MAX_UPLOADS_PER_HOUR <= 0:
-        return True
-    _prune_upload_times()
-    return len(_upload_times) < MAX_UPLOADS_PER_HOUR
-
-
-def record_successful_upload():
-    if MAX_UPLOADS_PER_HOUR <= 0:
+def _prefetch_api_ip():
+    """Resolve API_HOST once; connect uses IP to reduce per-request DNS failures."""
+    global API_RESOLVED_IP
+    if API_RESOLVED_IP is not None:
         return
-    _upload_times.append(time.monotonic())
+    try:
+        try:
+            infos = pool.getaddrinfo(API_HOST, API_PORT, 0, pool.SOCK_STREAM)
+        except TypeError:
+            infos = pool.getaddrinfo(API_HOST, API_PORT)
+    except Exception as e:
+        print(f"DNS prefetch skipped: {e}")
+        return
+    _af = getattr(pool, "AF_INET", 2)
+    for info in infos:
+        if info[0] == _af:
+            API_RESOLVED_IP = info[-1][0]
+            print(f"API {API_HOST} -> {API_RESOLVED_IP}")
+            return
+    if infos:
+        API_RESOLVED_IP = infos[0][-1][0]
+        print(f"API {API_HOST} -> {API_RESOLVED_IP}")
+
+
+def _send_all_eagain(sock, data):
+    """Send buffer in chunks; retry on EAGAIN (errno 11)."""
+    total = 0
+    n = len(data)
+    chunk_size = 256
+    while total < n:
+        end = min(total + chunk_size, n)
+        chunk = data[total:end]
+        offset = 0
+        clen = len(chunk)
+        while offset < clen:
+            tries = 0
+            while True:
+                try:
+                    sent = sock.send(chunk[offset:])
+                    break
+                except OSError as ex:
+                    err = getattr(ex, "errno", None)
+                    if err == 11:
+                        tries += 1
+                        if tries > _SEND_EAGAIN_MAX:
+                            raise
+                        time.sleep(_SEND_EAGAIN_SLEEP_S)
+                    else:
+                        raise
+            if sent == 0:
+                raise OSError("Connection broken")
+            offset += sent
+        total += clen
 
 
 def sanitize_frame(frame_data):
@@ -201,7 +235,7 @@ def generate_thermal_json(frame_data):
     if min_temp == 999.0 or max_temp == -999.0:
         min_temp = 0.0
         max_temp = 0.0
-    
+
     # Build JSON into a bytearray: mutable, grows in-place, no per-value string
     # object overhead. The old list+join approach created ~1500 small objects,
     # fragmenting the heap until the final join failed to find a contiguous block.
@@ -224,85 +258,90 @@ def generate_thermal_json(frame_data):
     buf += b']}'
     return buf
 
-def upload_thermal_data(json_data):
-    """Upload thermal data to API server via HTTP POST."""
-    try:
-        host, port, path = API_HOST, API_PORT, API_PATH
 
-        # Create socket connection
+def _upload_thermal_data_once(json_data):
+    """Single HTTP POST attempt. Uses cached IP for TCP if available."""
+    port, path = API_PORT, API_PATH
+    peer = API_RESOLVED_IP if API_RESOLVED_IP is not None else API_HOST
+    sock = None
+    try:
         try:
-            socket = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
+            sock = pool.socket(pool.AF_INET, pool.SOCK_STREAM)
         except (AttributeError, TypeError):
-            socket = pool.socket()
-        
+            sock = pool.socket()
+        sock.settimeout(SOCKET_TIMEOUT_S)
+        sock.connect((peer, port))
+
+        json_bytes = json_data
+        request = (
+            f"POST {path} HTTP/1.1\r\n"
+            f"Host: {API_HOST}:{port}\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(json_bytes)}\r\n"
+            "Connection: close\r\n"
+            "\r\n"
+        )
+        _send_all_eagain(sock, request.encode("utf-8"))
+        _send_all_eagain(sock, json_bytes)
+
         try:
-            socket.settimeout(15.0)
-            socket.connect((host, port))
-            
-            # Prepare HTTP POST request
-            json_bytes = json_data  # already a bytearray from generate_thermal_json
-            request = f"POST {path} HTTP/1.1\r\n"
-            request += f"Host: {host}:{port}\r\n"
-            request += "Content-Type: application/json\r\n"
-            request += f"Content-Length: {len(json_bytes)}\r\n"
-            request += "Connection: close\r\n"
-            request += "\r\n"
-            
-            # Send request header
-            request_bytes = request.encode('utf-8')
-            total_sent = 0
-            while total_sent < len(request_bytes):
-                sent = socket.send(request_bytes[total_sent:])
-                if sent == 0:
-                    raise OSError("Connection broken")
-                total_sent += sent
-            
-            # Send JSON data in small chunks
-            total_sent = 0
-            chunk_size = 256
-            while total_sent < len(json_bytes):
-                chunk = json_bytes[total_sent:total_sent + chunk_size]
-                sent = socket.send(chunk)
-                if sent == 0:
-                    raise OSError("Connection broken")
-                total_sent += sent
-            
-            # Read response to verify
+            bytes_read = sock.recv_into(_response_buffer, 512)
+            if bytes_read == 0:
+                return True  # body sent; peer closed before headers (unusual but ok)
+            response_str = _response_buffer[:bytes_read].decode("utf-8", errors="ignore")
+            if "200" in response_str or "success" in response_str.lower():
+                return True
+        except Exception:
+            return True  # optimistic if we fully sent the request body
+        return False
+    finally:
+        if sock is not None:
             try:
-                bytes_read = socket.recv_into(_response_buffer, 512)
-                # Check if response indicates success (200 OK)
-                response_str = _response_buffer[:bytes_read].decode('utf-8', errors='ignore')
-                if '200' in response_str or 'success' in response_str.lower():
-                    return True
-            except:
-                # If we can't read response, assume success if we sent all data
-                if total_sent == len(json_bytes):
-                    return True
-            
-            return False
-        finally:
-            try:
-                socket.close()
-            except:
+                sock.close()
+            except Exception:
                 pass
-    except OSError as e:
-        errno = getattr(e, 'errno', None)
-        if errno == 113:  # EHOSTUNREACH
-            print(f"Upload error: Host unreachable - check IP address")
-        elif errno == 111:  # ECONNREFUSED
-            print(f"Upload error: Connection refused - is server running?")
-        elif errno == 110:  # ETIMEDOUT
-            print(f"Upload error: Connection timeout")
-        else:
-            print(f"Upload error: {e} (errno: {errno})")
-        return False
-    except Exception as e:
-        print(f"Upload error: {e}")
-        return False
+
+
+def _print_upload_oserror(e):
+    errno = getattr(e, "errno", None)
+    if errno == 113:
+        print("Upload error: Host unreachable - check IP address")
+    elif errno == 111:
+        print("Upload error: Connection refused - is server running?")
+    elif errno in (110, 116):
+        print("Upload error: Connection timeout")
+    elif errno in (-2, 2) or (errno is None and "Name or service" in str(e)):
+        print("Upload error: DNS failed (will retry)")
+        global API_RESOLVED_IP
+        API_RESOLVED_IP = None
+    elif errno == 11:
+        print("Upload error: EAGAIN (will retry)")
+    else:
+        print(f"Upload error: {e} (errno: {errno})")
+
+
+def upload_thermal_data(json_data):
+    """Upload thermal data to API server via HTTP POST; retries transient failures."""
+    if API_RESOLVED_IP is None:
+        _prefetch_api_ip()
+    for attempt in range(UPLOAD_MAX_ATTEMPTS):
+        try:
+            if _upload_thermal_data_once(json_data):
+                return True
+        except OSError as e:
+            _print_upload_oserror(e)
+        except Exception as e:
+            print(f"Upload error: {e}")
+        if attempt + 1 < UPLOAD_MAX_ATTEMPTS:
+            time.sleep(UPLOAD_RETRY_DELAY_S)
+    if UPLOAD_MAX_ATTEMPTS > 1:
+        print(f"Upload gave up after {UPLOAD_MAX_ATTEMPTS} attempts")
+    return False
+
 
 def ensure_wifi_connected():
     """Reconnect to WiFi if the connection has dropped. Returns True if connected."""
-    global pool
+    global pool, API_RESOLVED_IP
     if wifi.radio.connected:
         return True
     print("WiFi disconnected, reconnecting...")
@@ -311,7 +350,9 @@ def ensure_wifi_connected():
             wifi.radio.connect(ssid=ssid, password=password)
         else:
             wifi.radio.connect(ssid=ssid)
+        API_RESOLVED_IP = None
         pool = socketpool.SocketPool(wifi.radio)
+        _prefetch_api_ip()
         print(f"Reconnected: {wifi.radio.ipv4_address}")
         return True
     except Exception as e:
@@ -322,6 +363,7 @@ def ensure_wifi_connected():
 # Main loop
 print(f"Connected to WiFi: {ip_addr}")
 print(f"API server: {API_URL}")
+_prefetch_api_ip()
 print("Starting thermal data upload...")
 
 if mlx is None:
@@ -330,8 +372,7 @@ if mlx is None:
 
 upload_count = 0
 skip_count = 0
-hourly_cap_skips = 0
-last_uploaded_frame = None  # sanitized frame from last successful upload; None = always upload once
+last_uploaded_frame = None  # sanitized frame from last successful upload; None = upload next
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
 
@@ -373,8 +414,8 @@ while True:
                     mlx = None
             time.sleep(UPLOAD_INTERVAL)
             continue
-        
-        # Sanitize and decide whether scene changed vs last successful upload
+
+        # Sanitize and optionally skip if scene barely changed vs last upload
         gc.collect()
         try:
             sanitized_frame = sanitize_frame(frame)
@@ -392,15 +433,6 @@ while True:
                 time.sleep(UPLOAD_INTERVAL)
                 continue
 
-        if MAX_UPLOADS_PER_HOUR > 0 and not upload_rate_under_cap():
-            hourly_cap_skips += 1
-            del sanitized_frame
-            gc.collect()
-            time.sleep(UPLOAD_INTERVAL)
-            continue
-
-        # Generate JSON and upload
-        gc.collect()
         try:
             json_data = generate_thermal_json(sanitized_frame)
         except Exception as e:
@@ -410,30 +442,27 @@ while True:
             time.sleep(UPLOAD_INTERVAL)
             continue
 
+        # Upload to API (use sanitized values for logging so min is realistic)
         min_temp = min(sanitized_frame)
         max_temp = max(sanitized_frame)
         if upload_thermal_data(json_data):
             upload_count += 1
-            record_successful_upload()
             last_uploaded_frame = sanitized_frame
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
             if skip_count:
                 msg += f" (skipped {skip_count} unchanged)"
                 skip_count = 0
-            if hourly_cap_skips:
-                msg += f" (hourly cap waited {hourly_cap_skips} polls)"
-                hourly_cap_skips = 0
             print(msg)
         else:
             print(f"Upload failed: {min_temp:.1f}°C - {max_temp:.1f}°C")
-            del sanitized_frame
 
+        del sanitized_frame
         del json_data
         gc.collect()
-        
+
         # Wait before next upload
         time.sleep(UPLOAD_INTERVAL)
-        
+
     except KeyboardInterrupt:
         print("\nStopped by user")
         break
