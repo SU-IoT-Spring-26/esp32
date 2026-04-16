@@ -5,6 +5,8 @@ Reads thermal data from MLX90640 sensor and uploads to API server.
 Poll interval: UPLOAD_INTERVAL. When MIN_MEAN_DELTA_C > 0, uploads only if the
 sanitized frame differs from the last successful upload by at least that mean
 absolute °C across pixels. Set MIN_MEAN_DELTA_C to 0 to upload every poll.
+A heartbeat upload is forced at least every HEARTBEAT_INTERVAL_S seconds
+regardless of the delta gate.
 """
 
 import time
@@ -55,6 +57,9 @@ UPLOAD_INTERVAL = 15.0
 # Reduces API traffic when the scene is static. Set to 0 to upload every poll.
 MIN_MEAN_DELTA_C = 0.2
 
+# Force an upload at least this often (seconds), even if the scene hasn't changed.
+HEARTBEAT_INTERVAL_S = 600.0
+
 # Initialize I2C bus
 gc.collect()
 i2c = None
@@ -102,7 +107,7 @@ for attempt in range(5):
         else:
             wifi.radio.connect(ssid=ssid)
         break
-    except ConnectionError as e:
+    except (ConnectionError, OSError, RuntimeError) as e:
         print(f"WiFi attempt {attempt + 1} failed: {e}")
         if attempt < 4:
             time.sleep(2)
@@ -273,9 +278,10 @@ def _upload_thermal_data_once(json_data):
         sock.connect((peer, port))
 
         json_bytes = json_data
+        host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
         request = (
             f"POST {path} HTTP/1.1\r\n"
-            f"Host: {API_HOST}:{port}\r\n"
+            f"Host: {host_header}\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(json_bytes)}\r\n"
             "Connection: close\r\n"
@@ -373,6 +379,7 @@ if mlx is None:
 upload_count = 0
 skip_count = 0
 last_uploaded_frame = None  # sanitized frame from last successful upload; None = upload next
+last_upload_time = None     # monotonic timestamp of last successful upload
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
 
@@ -424,7 +431,11 @@ while True:
             time.sleep(UPLOAD_INTERVAL)
             continue
 
-        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None:
+        heartbeat_due = (
+            last_upload_time is None
+            or (time.monotonic() - last_upload_time) >= HEARTBEAT_INTERVAL_S
+        )
+        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None and not heartbeat_due:
             delta = mean_abs_frame_diff(sanitized_frame, last_uploaded_frame)
             if delta < MIN_MEAN_DELTA_C:
                 skip_count += 1
@@ -448,6 +459,7 @@ while True:
         if upload_thermal_data(json_data):
             upload_count += 1
             last_uploaded_frame = sanitized_frame
+            last_upload_time = time.monotonic()
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
             if skip_count:
                 msg += f" (skipped {skip_count} unchanged)"
