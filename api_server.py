@@ -685,5 +685,5 @@ if __name__ == '__main__':
     print("\nWaiting for ESP32 to send thermal data...\n")
     
     # Run on all interfaces so ESP32 can connect. Use PORT from env (e.g. Azure).
-    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+    debug = os.environ.get('FLASK_DEBUG', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}
     app.run(host='0.0.0.0', port=port, debug=debug)

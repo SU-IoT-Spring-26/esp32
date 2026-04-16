@@ -198,11 +198,12 @@ This repository contains a complete thermal imaging and occupancy detection syst
 **Compact Format** (ESP32 → Server):
 ```json
 {
+  "sensor_id": "room-101",
   "w": 32,
   "h": 24,
   "min": 20.5,
   "max": 35.2,
-  "t": [20.5, 20.6, ...]  // 768 temperature values
+  "t": [20.5, 20.6, ...]
 }
 ```
 
@@ -225,9 +226,9 @@ This repository contains a complete thermal imaging and occupancy detection syst
 ### Directory Structure
 ```
 thermal_data/
-├── thermal_YYYYMMDD_HHMMSS_MMM_compact.json    # Original ESP32 data
-├── thermal_YYYYMMDD_HHMMSS_MMM_expanded.json  # Processed with colors
-└── occupancy_YYYYMMDD.jsonl                  # Daily occupancy log
+├── thermal_{sensor_id}_YYYYMMDD_HHMMSS_MMM_compact.json   # Original ESP32 data
+├── thermal_{sensor_id}_YYYYMMDD_HHMMSS_MMM_expanded.json  # Processed with colors
+└── occupancy_YYYYMMDD.jsonl                               # Daily log, all sensors
 ```
 
 ### File Formats
