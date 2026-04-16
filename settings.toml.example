@@ -5,8 +5,7 @@ WIFI_SSID = "AirOrangeX"
 # WIFI_PASSWORD = ""
 
 # Unique ID for this sensor (used when uploading to API server). Set a different value per device.
-# SENSOR_ID = "living-room"
-# SENSOR_ID = "office"
+SENSOR_ID = "sensor-1"
 
 # Using CIRCUITPY_WIFI_PASSWORD and SSID will autostart the web workflow
 # we can save ~40KB of RAM by not autostarting it simply by using variables

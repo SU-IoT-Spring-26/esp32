@@ -32,7 +32,6 @@ ROOM_TEMP_THRESHOLD = 0.5  # Temperature difference from median to consider as b
 latest_thermal_data = None
 last_update_time = None
 latest_occupancy = None  # Store latest occupancy estimate
-_data_counter = 0  # Counter for sequential file naming
 
 # Create data directory if it doesn't exist
 if SAVE_DATA:
@@ -193,8 +192,6 @@ def _sanitize_sensor_id_for_filename(sensor_id):
 
 def save_thermal_data(compact_data, expanded_data, sensor_id=None):
     """Save thermal data to disk."""
-    global _data_counter
-    
     if not SAVE_DATA:
         return
     
@@ -225,7 +222,6 @@ def save_thermal_data(compact_data, expanded_data, sensor_id=None):
                 "data": expanded_data
             }, f, indent=2)
         
-        _data_counter += 1
         print(f"Saved thermal data: {compact_filename.name} ({expanded_filename.name})")
         
     except Exception as e:
@@ -689,4 +685,5 @@ if __name__ == '__main__':
     print("\nWaiting for ESP32 to send thermal data...\n")
     
     # Run on all interfaces so ESP32 can connect. Use PORT from env (e.g. Azure).
-    app.run(host='0.0.0.0', port=port, debug=True)
+    debug = os.environ.get('FLASK_DEBUG', 'false').lower() == 'true'
+    app.run(host='0.0.0.0', port=port, debug=debug)
