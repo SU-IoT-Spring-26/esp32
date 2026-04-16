@@ -382,6 +382,8 @@ last_uploaded_frame = None  # sanitized frame from last successful upload; None 
 last_upload_time = None     # monotonic timestamp of last successful upload
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
+consecutive_upload_failures = 0
+MAX_UPLOAD_FAILURES_BEFORE_RECONNECT = 5  # ~75 s of failed uploads triggers a WiFi radio cycle
 
 while True:
     try:
@@ -458,6 +460,7 @@ while True:
         max_temp = max(sanitized_frame)
         if upload_thermal_data(json_data):
             upload_count += 1
+            consecutive_upload_failures = 0
             last_uploaded_frame = sanitized_frame
             last_upload_time = time.monotonic()
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
@@ -466,7 +469,20 @@ while True:
                 skip_count = 0
             print(msg)
         else:
-            print(f"Upload failed: {min_temp:.1f}°C - {max_temp:.1f}°C")
+            consecutive_upload_failures += 1
+            print(f"Upload failed ({consecutive_upload_failures}/{MAX_UPLOAD_FAILURES_BEFORE_RECONNECT}): {min_temp:.1f}°C - {max_temp:.1f}°C")
+            if consecutive_upload_failures >= MAX_UPLOAD_FAILURES_BEFORE_RECONNECT:
+                # wifi.radio.connected can stay True even when the connection is broken (associated
+                # but not routing). Cycle the radio so ensure_wifi_connected() does a clean reconnect.
+                print("Cycling WiFi radio after repeated upload failures...")
+                consecutive_upload_failures = 0
+                try:
+                    wifi.radio.enabled = False
+                    gc.collect()
+                    time.sleep(2)
+                    wifi.radio.enabled = True
+                except Exception as e:
+                    print(f"WiFi radio cycle error: {e}")
 
         del sanitized_frame
         del json_data
