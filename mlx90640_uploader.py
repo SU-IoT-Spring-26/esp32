@@ -476,8 +476,9 @@ while True:
         time.sleep(UPLOAD_INTERVAL)
 
     except KeyboardInterrupt:
-        print("\nStopped by user")
-        break
+        # Ignore DTR toggles from serial terminal connect/disconnect on CH340/CP2102 boards.
+        # A real Ctrl+C from Thonny will send repeated interrupts and can still stop via the REPL.
+        pass
     except Exception as e:
         print(f"Error in main loop: {e}")
         time.sleep(UPLOAD_INTERVAL)
