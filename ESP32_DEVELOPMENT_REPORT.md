@@ -298,11 +298,69 @@ assigns a 5-byte bytes literal to a 6-byte slice. In MicroPython/CircuitPython, 
 | `_deep_sleep_reset()` for all resets | `alarm.exit_and_deep_sleep_until_alarms()` instead of `microcontroller.reset()` | Prevents `espidf.MemoryError` at I2C init caused by stale IDF WiFi DRAM after SW_CPU_RESET |
 | `_deep_sleep_reset` defined before WiFi block | Move function def above its first call site | Prevents `NameError` if all 5 initial WiFi attempts fail |
 
+| `supervisor.reload()` on cold-boot OOM | Soft restart preserves WiFi init state; second run has smaller IDF overhead | Eliminates crash-and-wait on first power-on from non-USB supply |
+| Skip print with delta and countdown | Print `delta=X hb_in=Ys` on each skipped frame | Makes delta-gate behaviour visible; allows threshold tuning |
+
+---
+
+## Phase 12 — Cold Boot OOM on Non-USB Power
+
+After deploying to a battery pack for standalone operation, the device exhibited a crash-and-stall pattern on every cold power-on:
+
+```
+rst:0x1 (POWERON_RESET)
+...
+espidf.MemoryError: Out of memory   ← code.py line 59 (busio.I2C)
+Code done running.
+[device sits idle, blue LED double-blinks, no uploads]
+```
+
+Pressing reset or sending CTRL-D triggered a soft reboot, after which the device started normally and uploaded successfully. The device had been working on USB laptop power but failed consistently from a battery pack or wall adapter.
+
+**Root cause: ESP-IDF WiFi cold-start overhead.** When `import wifi` is executed on a fresh POWERON_RESET, the ESP-IDF initialises the WiFi hardware from a completely cold state, allocating additional temporary IDF DRAM buffers for the initialisation sequence. These buffers are not needed once initialisation is complete, but they are present at the moment `busio.I2C()` runs at line 59, shrinking the available Python heap below the threshold required for the I2C allocation. On USB laptop power this was not observed because the device was already in a partially-warm state (the serial terminal had been in use, and soft reloads had occurred during development). On a genuinely cold boot from a battery, the full cold-init overhead was always present.
+
+On a soft reboot (`supervisor.reload()` or CTRL-D), CircuitPython restarts its Python runtime without resetting the ESP-IDF layer. The WiFi hardware is already initialised from the previous (failed) boot, so `import wifi` on the second run reuses the existing state and incurs much less IDF DRAM overhead. The Python heap is large enough for `busio.I2C()` to succeed.
+
+This is distinct from the SW_CPU_RESET issue documented in Phase 7. That issue caused OOM by leaving *persistent* WiFi session DRAM across reboots. This issue is caused by *transient* cold-initialisation overhead that only exists for the first few milliseconds of the first boot.
+
+**Fix: `supervisor.reload()` on MemoryError at I2C init.** The `MemoryError` from `busio.I2C()` is caught and `supervisor.reload()` is called immediately rather than letting the script crash and sit idle. `supervisor` is a CircuitPython built-in C module that does not require Python heap to import. The call is unconditional — this failure mode only occurs on the first cold boot, not on subsequent soft restarts, so there is no risk of a reload loop.
+
+```python
+except MemoryError:
+    import supervisor
+    supervisor.reload()
+```
+
+After this fix, the cold-boot sequence is transparent to the user: the first boot fails silently and immediately triggers a soft restart; the second boot succeeds within a few seconds and begins uploading normally. No manual intervention is required.
+
+---
+
+## Phase 13 — Delta Gate Behaviour Not Visible in Serial Output
+
+During field testing, the device appeared to be stuck after the first upload. The serial console showed `Upload #1: ...` and then nothing, even when the thermal scene changed visibly. This was not a bug — the delta gate was working correctly and suppressing uploads where the scene's mean temperature had not shifted by the required 0.2°C — but the silence made it impossible to distinguish a correctly-skipping device from a crashed one.
+
+The 0.2°C threshold reflects the narrow field of view issue: the MLX90640 has a 110°×75° field of view. When ceiling-mounted, a single person may occupy only 10–20% of the frame. Their thermal contribution to the 768-pixel mean is diluted by the surrounding room pixels, so even a person walking into frame may only shift the mean by 0.1–0.3°C. A threshold too high means valid occupancy changes are skipped; a threshold too low causes spurious uploads in rooms where temperature naturally drifts.
+
+Additionally, the heartbeat (forced upload every 60 seconds) was not well understood during initial testing. Users expected an upload every 15 seconds when the scene changed, but the delta gate was correctly suppressing uploads when the shift was below threshold, and the next visible upload would only appear at the 60-second heartbeat mark — printed as `Upload #N: ... (skipped M unchanged)`.
+
+**Fix: print delta and heartbeat countdown on each skip.** Each skipped frame now prints:
+
+```
+Skip #1 delta=0.05 hb_in=45s
+Skip #2 delta=0.11 hb_in=30s
+Skip #3 delta=0.08 hb_in=15s
+Upload #2: 22.1 - 28.6 (skipped 3 unchanged)
+```
+
+This makes the delta-gate behaviour fully transparent: the actual temperature delta is visible on every cycle, allowing the `MIN_MEAN_DELTA_C` threshold to be tuned by observation, and the heartbeat countdown shows exactly when the next forced upload will occur.
+
 ---
 
 ## Final Architecture: `code.py` Safeguards
 
-The final version of `code.py` (also mirrored as `mlx90640_uploader.py`) provides reliable continuous operation through the following layered safeguards:
+The canonical device firmware is `code.py`. `mlx90640_uploader.py` was an earlier duplicate that has been removed to avoid deployment confusion. `mlx90640_simple.py` is retained as a fallback that uploads every frame unconditionally (no delta gate) for use when debugging the full uploader.
+
+`code.py` provides reliable continuous operation through the following layered safeguards:
 
 ### Memory Safety
 - All large buffers (`frame`, `_response_buffer`, `_pixel_buf`, `_opening_buf`, `_hex_buf`, `_REQUEST_BYTES`, all `memoryview` wrappers) are allocated at module level **before** WiFi connects, preserving a single contiguous free block that `getFrame()` can always use.
@@ -337,3 +395,4 @@ The final version of `code.py` (also mirrored as `mlx90640_uploader.py`) provide
 - Uploads are skipped when the scene's mean temperature has changed by less than `MIN_MEAN_DELTA_C` (0.2°C) since the last upload, reducing traffic in static rooms.
 - A heartbeat forces an upload at least every `HEARTBEAT_INTERVAL_S` (60 seconds) regardless of the delta, ensuring fresh data reaches the API continuously.
 - The heartbeat interval (60 s) is small enough that the dashboard never appears stale and the watchdog threshold (900 s) is safely far away.
+- Each skipped frame prints the actual delta and seconds until next heartbeat, making threshold tuning straightforward from the serial console.
