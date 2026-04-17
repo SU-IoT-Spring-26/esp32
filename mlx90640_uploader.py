@@ -86,12 +86,10 @@ try:
 except Exception:
     mlx = None
 
-# Frame buffers as flat float32 arrays: 4 bytes/element vs ~16 bytes for a Python float
-# object list, reducing 3×768-element buffers from ~39 KB to ~9 KB.
+# array('f') stores 4 bytes/element vs ~16 bytes for a Python float object list,
+# saving ~10 KB vs the original [0.0] * FRAME_SIZE declaration.
 gc.collect()
-frame                   = array('f', [0.0] * FRAME_SIZE)
-_sanitized_frame_buf    = array('f', frame)
-_last_uploaded_frame_buf = array('f', frame)
+frame = array('f', [0.0] * FRAME_SIZE)
 gc.collect()
 
 # WiFi configuration
@@ -208,18 +206,19 @@ def _send_all_eagain(sock, data):
         total += clen
 
 
-def _sanitize_frame(src, dst):
-    """Sanitize src into dst in-place; invalid pixels replaced by min valid temp."""
+def sanitize_frame(frame_data):
+    """Return a new list where invalid pixels are replaced by the minimum valid temperature."""
     min_valid = None
-    for v in src:
+    for v in frame_data:
         if v is not None and v > INVALID_TEMP_THRESHOLD:
             if min_valid is None or v < min_valid:
                 min_valid = v
     if min_valid is None:
         min_valid = 0.0
-    for i in range(len(src)):
-        v = src[i]
-        dst[i] = v if (v is not None and v > INVALID_TEMP_THRESHOLD) else min_valid
+    sanitized = []
+    for v in frame_data:
+        sanitized.append(v if (v is not None and v > INVALID_TEMP_THRESHOLD) else min_valid)
+    return sanitized
 
 
 def generate_thermal_json(frame_data):
@@ -390,7 +389,7 @@ if mlx is None:
 
 upload_count = 0
 skip_count = 0
-_has_last_upload = False    # True once _last_uploaded_frame_buf is populated
+last_uploaded_frame = None  # array('f') snapshot after each successful upload; None = upload next
 last_upload_time = None     # monotonic timestamp of last successful upload
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
@@ -436,10 +435,10 @@ while True:
             time.sleep(UPLOAD_INTERVAL)
             continue
 
-        # Sanitize into pre-allocated buffer (no new list allocation)
+        # Sanitize frame (new list each iteration; freed after upload or skip)
         gc.collect()
         try:
-            _sanitize_frame(frame, _sanitized_frame_buf)
+            sanitized_frame = sanitize_frame(frame)
         except Exception as e:
             print(f"Error sanitizing frame: {e}")
             time.sleep(UPLOAD_INTERVAL)
@@ -449,30 +448,32 @@ while True:
             last_upload_time is None
             or (time.monotonic() - last_upload_time) >= HEARTBEAT_INTERVAL_S
         )
-        if MIN_MEAN_DELTA_C > 0 and _has_last_upload and not heartbeat_due:
-            delta = mean_abs_frame_diff(_sanitized_frame_buf, _last_uploaded_frame_buf)
+        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None and not heartbeat_due:
+            delta = mean_abs_frame_diff(sanitized_frame, last_uploaded_frame)
             if delta < MIN_MEAN_DELTA_C:
                 skip_count += 1
+                del sanitized_frame
                 gc.collect()
                 time.sleep(UPLOAD_INTERVAL)
                 continue
 
         try:
-            json_bytes = generate_thermal_json(_sanitized_frame_buf)
+            json_bytes = generate_thermal_json(sanitized_frame)
         except Exception as e:
             print(f"Error generating JSON: {e}")
+            del sanitized_frame
             gc.collect()
             time.sleep(UPLOAD_INTERVAL)
             continue
 
         # Upload to API (use sanitized values for logging so min is realistic)
-        min_temp = min(_sanitized_frame_buf)
-        max_temp = max(_sanitized_frame_buf)
+        min_temp = min(sanitized_frame)
+        max_temp = max(sanitized_frame)
         if upload_thermal_data(json_bytes):
             upload_count += 1
             consecutive_upload_failures = 0
-            _last_uploaded_frame_buf[:] = _sanitized_frame_buf  # in-place copy, no allocation
-            _has_last_upload = True
+            # Store as array('f') — 3 KB instead of ~13 KB for a Python float list
+            last_uploaded_frame = array('f', sanitized_frame)
             last_upload_time = time.monotonic()
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
             if skip_count:
@@ -495,6 +496,7 @@ while True:
                 except Exception as e:
                     print(f"WiFi radio cycle error: {e}")
 
+        del sanitized_frame
         gc.collect()
 
         # Wait before next upload
