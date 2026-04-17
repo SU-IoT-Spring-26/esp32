@@ -275,6 +275,7 @@ def _upload_thermal_data_once(frame_data):
             "\r\n"
         )
         _send_all_eagain(sock, request.encode("utf-8"))
+        del request
 
         # Compute min/max for the JSON envelope (no extra allocation; frame_data is array('f'))
         min_temp = 999.0
@@ -303,7 +304,7 @@ def _upload_thermal_data_once(frame_data):
 
         # Stream 768 pixels in 32-pixel batches.  pixel_buf is reused each batch;
         # peak allocation here is ~256 bytes vs the old 6144 byte _json_buf.
-        pixel_buf = bytearray(256)
+        pixel_buf = bytearray(288)  # 32 pixels × (1 comma + 8 chars max) = 288
         for batch_start in range(0, FRAME_SIZE, 32):
             pos = 0
             batch_end = min(batch_start + 32, FRAME_SIZE)
