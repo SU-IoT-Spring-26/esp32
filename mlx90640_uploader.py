@@ -106,6 +106,7 @@ for attempt in range(5):
             wifi.radio.connect(ssid=ssid, password=password)
         else:
             wifi.radio.connect(ssid=ssid)
+        time.sleep(2)  # let lwIP TCP stack finish initialising after association
         break
     except (ConnectionError, OSError, RuntimeError) as e:
         print(f"WiFi attempt {attempt + 1} failed: {e}")
@@ -276,6 +277,7 @@ def _upload_thermal_data_once(json_data):
             sock = pool.socket()
         sock.settimeout(SOCKET_TIMEOUT_S)
         sock.connect((peer, port))
+        time.sleep(0.2)  # let lwIP complete the TCP handshake before sending
 
         json_bytes = json_data
         host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
@@ -356,6 +358,7 @@ def ensure_wifi_connected():
             wifi.radio.connect(ssid=ssid, password=password)
         else:
             wifi.radio.connect(ssid=ssid)
+        time.sleep(2)  # let lwIP TCP stack finish initialising after association
         API_RESOLVED_IP = None
         pool = socketpool.SocketPool(wifi.radio)
         _prefetch_api_ip()
