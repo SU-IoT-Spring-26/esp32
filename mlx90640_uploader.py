@@ -86,10 +86,9 @@ try:
 except Exception:
     mlx = None
 
-# array('f') stores 4 bytes/element vs ~16 bytes for a Python float object list,
-# saving ~10 KB vs the original [0.0] * FRAME_SIZE declaration.
+# Frame buffer for thermal data
 gc.collect()
-frame = array('f', [0.0] * FRAME_SIZE)
+frame = [0.0] * FRAME_SIZE
 gc.collect()
 
 # WiFi configuration
@@ -134,8 +133,9 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 
 # Allocated once to avoid repeated heap churn on every upload
 _response_buffer = bytearray(512)
+# Allocated on first use (after getFrame clears its internal temporaries)
 # 5120 bytes fits 768 temps at 1 dp (max 6 chars each = 4608) + ~200 header bytes
-_json_buf = bytearray(5120)
+_json_buf = None
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
@@ -226,7 +226,11 @@ def generate_thermal_json(frame_data):
 
     Uses slice-assignment instead of bytearray += to avoid repeated reallocs that
     fragment the heap and cause MemoryError on subsequent mlx.getFrame() calls.
+    _json_buf is allocated on first call so it doesn't consume startup heap.
     """
+    global _json_buf
+    if _json_buf is None:
+        _json_buf = bytearray(5120)
     min_temp = 999.0
     max_temp = -999.0
     for v in frame_data:
