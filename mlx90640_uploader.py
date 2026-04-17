@@ -125,8 +125,8 @@ gc.collect()
 UPLOAD_MAX_ATTEMPTS = 3
 UPLOAD_RETRY_DELAY_S = 1.0
 SOCKET_TIMEOUT_S = 20.0
-_SEND_EAGAIN_MAX = 50
-_SEND_EAGAIN_SLEEP_S = 0.05
+_SEND_EAGAIN_MAX = 200
+_SEND_EAGAIN_SLEEP_S = 0.1
 
 # Color mapping moved to server to save ESP32 memory
 
@@ -277,7 +277,7 @@ def _upload_thermal_data_once(json_data):
             sock = pool.socket()
         sock.settimeout(SOCKET_TIMEOUT_S)
         sock.connect((peer, port))
-        time.sleep(0.2)  # let lwIP complete the TCP handshake before sending
+        time.sleep(3)  # let lwIP complete the TCP handshake before sending
 
         json_bytes = json_data
         host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
