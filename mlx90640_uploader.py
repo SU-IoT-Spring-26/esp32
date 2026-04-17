@@ -132,6 +132,11 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 
 # Allocated once to avoid repeated heap churn on every upload
 _response_buffer = bytearray(512)
+# 5120 bytes fits 768 temps at 1 dp (max 6 chars each = 4608) + ~200 header bytes
+_json_buf = bytearray(5120)
+# Reused every loop to avoid allocating a new 768-float list per frame
+_sanitized_frame_buf = [0.0] * FRAME_SIZE
+_last_uploaded_frame_buf = [0.0] * FRAME_SIZE
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
@@ -202,33 +207,26 @@ def _send_all_eagain(sock, data):
         total += clen
 
 
-def sanitize_frame(frame_data):
-    """Return a new list where invalid pixels are replaced by the minimum valid temperature.
-
-    This avoids uploading impossible values like -273.15°C while preserving shape.
-    """
-    # Collect valid temps
-    valid = []
-    for v in frame_data:
+def _sanitize_frame(src, dst):
+    """Sanitize src into dst in-place; invalid pixels replaced by min valid temp."""
+    min_valid = None
+    for v in src:
         if v is not None and v > INVALID_TEMP_THRESHOLD:
-            valid.append(v)
-    if not valid:
-        # If everything looks invalid, replace with a safe constant so logs and uploads
-        # never show impossible values like -273.15°C.
-        return [0.0] * len(frame_data)
-    min_valid = min(valid)
-    sanitized = []
-    for v in frame_data:
-        if v is None or v <= INVALID_TEMP_THRESHOLD:
-            sanitized.append(min_valid)
-        else:
-            sanitized.append(v)
-    return sanitized
+            if min_valid is None or v < min_valid:
+                min_valid = v
+    if min_valid is None:
+        min_valid = 0.0
+    for i in range(len(src)):
+        v = src[i]
+        dst[i] = v if (v is not None and v > INVALID_TEMP_THRESHOLD) else min_valid
 
 
 def generate_thermal_json(frame_data):
-    """Generate minimal JSON with just raw temperature data - very memory efficient."""
-    # Calculate min/max for the server to use, ignoring invalid pixels
+    """Write JSON into module-level _json_buf; returns a memoryview of the written bytes.
+
+    Uses slice-assignment instead of bytearray += to avoid repeated reallocs that
+    fragment the heap and cause MemoryError on subsequent mlx.getFrame() calls.
+    """
     min_temp = 999.0
     max_temp = -999.0
     for v in frame_data:
@@ -237,32 +235,42 @@ def generate_thermal_json(frame_data):
                 min_temp = v
             if v > max_temp:
                 max_temp = v
-    # Fallback if everything was invalid
     if min_temp == 999.0 or max_temp == -999.0:
         min_temp = 0.0
         max_temp = 0.0
 
-    # Build JSON into a bytearray: mutable, grows in-place, no per-value string
-    # object overhead. The old list+join approach created ~1500 small objects,
-    # fragmenting the heap until the final join failed to find a contiguous block.
+    pos = 0
     safe_id = SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"')
-    buf = bytearray(b'{"sensor_id":"')
-    buf += safe_id.encode('utf-8')
-    buf += b'","w":'
-    buf += str(MLX_SHAPE[1]).encode()
-    buf += b',"h":'
-    buf += str(MLX_SHAPE[0]).encode()
-    buf += b',"min":'
-    buf += str(round(min_temp, 1)).encode()
-    buf += b',"max":'
-    buf += str(round(max_temp, 1)).encode()
-    buf += b',"t":['
-    buf += str(round(frame_data[0], 1)).encode()
+
+    def wr(b):
+        nonlocal pos
+        n = len(b)
+        _json_buf[pos:pos + n] = b
+        pos += n
+
+    wr(b'{"sensor_id":"')
+    wr(safe_id.encode('utf-8'))
+    wr(b'","w":')
+    wr(str(MLX_SHAPE[1]).encode())
+    wr(b',"h":')
+    wr(str(MLX_SHAPE[0]).encode())
+    wr(b',"min":')
+    wr(str(round(min_temp, 1)).encode())
+    wr(b',"max":')
+    wr(str(round(max_temp, 1)).encode())
+    wr(b',"t":[')
+    wr(str(round(frame_data[0], 1)).encode())
     for i in range(1, len(frame_data)):
-        buf += b','
-        buf += str(round(frame_data[i], 1)).encode()
-    buf += b']}'
-    return buf
+        _json_buf[pos] = 44  # ','
+        pos += 1
+        t = str(round(frame_data[i], 1)).encode()
+        n = len(t)
+        _json_buf[pos:pos + n] = t
+        pos += n
+    _json_buf[pos] = 93    # ']'
+    _json_buf[pos + 1] = 125  # '}'
+    pos += 2
+    return memoryview(_json_buf)[:pos]
 
 
 def _upload_thermal_data_once(json_data):
@@ -276,11 +284,8 @@ def _upload_thermal_data_once(json_data):
         except (AttributeError, TypeError):
             sock = pool.socket()
         sock.settimeout(SOCKET_TIMEOUT_S)
-        print(f"DBG connecting to {peer}:{port}")
         sock.connect((peer, port))
-        print("DBG connect() returned OK")
         time.sleep(3)  # let lwIP complete the TCP handshake before sending
-        print("DBG post-sleep, sending headers")
 
         json_bytes = json_data
         host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
@@ -293,9 +298,7 @@ def _upload_thermal_data_once(json_data):
             "\r\n"
         )
         _send_all_eagain(sock, request.encode("utf-8"))
-        print("DBG headers sent, sending body")
         _send_all_eagain(sock, json_bytes)
-        print("DBG body sent")
 
         try:
             bytes_read = sock.recv_into(_response_buffer, 512)
@@ -386,7 +389,7 @@ if mlx is None:
 
 upload_count = 0
 skip_count = 0
-last_uploaded_frame = None  # sanitized frame from last successful upload; None = upload next
+_has_last_upload = False    # True once _last_uploaded_frame_buf is populated
 last_upload_time = None     # monotonic timestamp of last successful upload
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
@@ -432,10 +435,10 @@ while True:
             time.sleep(UPLOAD_INTERVAL)
             continue
 
-        # Sanitize and optionally skip if scene barely changed vs last upload
+        # Sanitize into pre-allocated buffer (no new list allocation)
         gc.collect()
         try:
-            sanitized_frame = sanitize_frame(frame)
+            _sanitize_frame(frame, _sanitized_frame_buf)
         except Exception as e:
             print(f"Error sanitizing frame: {e}")
             time.sleep(UPLOAD_INTERVAL)
@@ -445,31 +448,30 @@ while True:
             last_upload_time is None
             or (time.monotonic() - last_upload_time) >= HEARTBEAT_INTERVAL_S
         )
-        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None and not heartbeat_due:
-            delta = mean_abs_frame_diff(sanitized_frame, last_uploaded_frame)
+        if MIN_MEAN_DELTA_C > 0 and _has_last_upload and not heartbeat_due:
+            delta = mean_abs_frame_diff(_sanitized_frame_buf, _last_uploaded_frame_buf)
             if delta < MIN_MEAN_DELTA_C:
                 skip_count += 1
-                del sanitized_frame
                 gc.collect()
                 time.sleep(UPLOAD_INTERVAL)
                 continue
 
         try:
-            json_data = generate_thermal_json(sanitized_frame)
+            json_bytes = generate_thermal_json(_sanitized_frame_buf)
         except Exception as e:
             print(f"Error generating JSON: {e}")
-            del sanitized_frame
             gc.collect()
             time.sleep(UPLOAD_INTERVAL)
             continue
 
         # Upload to API (use sanitized values for logging so min is realistic)
-        min_temp = min(sanitized_frame)
-        max_temp = max(sanitized_frame)
-        if upload_thermal_data(json_data):
+        min_temp = min(_sanitized_frame_buf)
+        max_temp = max(_sanitized_frame_buf)
+        if upload_thermal_data(json_bytes):
             upload_count += 1
             consecutive_upload_failures = 0
-            last_uploaded_frame = sanitized_frame
+            _last_uploaded_frame_buf[:] = _sanitized_frame_buf  # in-place copy, no allocation
+            _has_last_upload = True
             last_upload_time = time.monotonic()
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
             if skip_count:
@@ -492,8 +494,6 @@ while True:
                 except Exception as e:
                     print(f"WiFi radio cycle error: {e}")
 
-        del sanitized_frame
-        del json_data
         gc.collect()
 
         # Wait before next upload
