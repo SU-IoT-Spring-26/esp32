@@ -12,6 +12,7 @@ regardless of the delta gate.
 import time
 import os
 import gc
+from array import array
 gc.collect()
 
 import board
@@ -85,9 +86,12 @@ try:
 except Exception:
     mlx = None
 
-# Frame buffer for thermal data
+# Frame buffers as flat float32 arrays: 4 bytes/element vs ~16 bytes for a Python float
+# object list, reducing 3×768-element buffers from ~39 KB to ~9 KB.
 gc.collect()
-frame = [0.0] * FRAME_SIZE
+frame                   = array('f', [0.0] * FRAME_SIZE)
+_sanitized_frame_buf    = array('f', frame)
+_last_uploaded_frame_buf = array('f', frame)
 gc.collect()
 
 # WiFi configuration
@@ -134,9 +138,6 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 _response_buffer = bytearray(512)
 # 5120 bytes fits 768 temps at 1 dp (max 6 chars each = 4608) + ~200 header bytes
 _json_buf = bytearray(5120)
-# Reused every loop to avoid allocating a new 768-float list per frame
-_sanitized_frame_buf = [0.0] * FRAME_SIZE
-_last_uploaded_frame_buf = [0.0] * FRAME_SIZE
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
