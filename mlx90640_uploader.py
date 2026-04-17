@@ -61,20 +61,27 @@ MIN_MEAN_DELTA_C = 0.2
 # Force an upload at least this often (seconds), even if the scene hasn't changed.
 HEARTBEAT_INTERVAL_S = 600.0
 
-# Initialize I2C bus
+# Initialize I2C bus at 400 kHz (standard Fast-mode; within MLX90640 spec and more
+# reliable over typical wire lengths than 800 kHz).  If the bus is already in use
+# (e.g. a previous script didn't deinit it), deinit the singleton and reinitialise
+# at the correct frequency — falling back to board.I2C() would give 100 kHz which
+# is too slow for the MLX90640 at 4 Hz refresh rate.
 gc.collect()
 i2c = None
 try:
-    i2c = busio.I2C(board.SCL, board.SDA, frequency=800000)
+    i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
     gc.collect()
 except ValueError as e:
-    if "in use" in str(e).lower() and hasattr(board, 'I2C'):
-        i2c = board.I2C()
+    if "in use" in str(e).lower():
+        try:
+            if hasattr(board, 'I2C'):
+                board.I2C().deinit()
+        except Exception:
+            pass
+        i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
         gc.collect()
     else:
         raise
-except Exception as e:
-    raise
 
 # Initialize MLX90640 sensor
 gc.collect()
@@ -133,8 +140,9 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 
 # Allocated once to avoid repeated heap churn on every upload
 _response_buffer = bytearray(512)
-# Allocated on first use (after getFrame clears its internal temporaries)
-# 5120 bytes fits 768 temps at 1 dp (max 6 chars each = 4608) + ~200 header bytes
+# Allocated on first use (after getFrame clears its internal temporaries).
+# Worst-case size: 768 pixels × 7 bytes ("-199.9,") = 5376 + ~150 bytes header/footer = 5526.
+# 6144 gives a safe margin.
 _json_buf = None
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
@@ -237,7 +245,7 @@ def generate_thermal_json(frame_data):
     """
     global _json_buf
     if _json_buf is None:
-        _json_buf = bytearray(5120)
+        _json_buf = bytearray(6144)
     min_temp = 999.0
     max_temp = -999.0
     for v in frame_data:
@@ -265,15 +273,15 @@ def generate_thermal_json(frame_data):
     wr(b',"h":')
     wr(str(MLX_SHAPE[0]).encode())
     wr(b',"min":')
-    wr(str(round(min_temp, 1)).encode())
+    wr(("%.1f" % min_temp).encode())
     wr(b',"max":')
-    wr(str(round(max_temp, 1)).encode())
+    wr(("%.1f" % max_temp).encode())
     wr(b',"t":[')
-    wr(str(round(frame_data[0], 1)).encode())
+    wr(("%.1f" % frame_data[0]).encode())
     for i in range(1, len(frame_data)):
         _json_buf[pos] = 44  # ','
         pos += 1
-        t = str(round(frame_data[i], 1)).encode()
+        t = ("%.1f" % frame_data[i]).encode()
         n = len(t)
         _json_buf[pos:pos + n] = t
         pos += n
