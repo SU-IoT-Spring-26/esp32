@@ -276,8 +276,11 @@ def _upload_thermal_data_once(json_data):
         except (AttributeError, TypeError):
             sock = pool.socket()
         sock.settimeout(SOCKET_TIMEOUT_S)
+        print(f"DBG connecting to {peer}:{port}")
         sock.connect((peer, port))
+        print("DBG connect() returned OK")
         time.sleep(3)  # let lwIP complete the TCP handshake before sending
+        print("DBG post-sleep, sending headers")
 
         json_bytes = json_data
         host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
@@ -290,7 +293,9 @@ def _upload_thermal_data_once(json_data):
             "\r\n"
         )
         _send_all_eagain(sock, request.encode("utf-8"))
+        print("DBG headers sent, sending body")
         _send_all_eagain(sock, json_bytes)
+        print("DBG body sent")
 
         try:
             bytes_read = sock.recv_into(_response_buffer, 512)
