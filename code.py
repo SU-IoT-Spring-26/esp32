@@ -422,9 +422,12 @@ def _upload_thermal_data_once(frame_data, min_temp, max_temp):
             bytes_read = sock.recv_into(_response_buffer, 512)
             if bytes_read == 0:
                 return True  # body sent; peer closed before headers (unusual but ok)
-            # bytearray.__contains__ correctly handles multi-byte search;
-            # memoryview.__contains__ in CircuitPython only supports integers.
-            if b"200" in _response_buffer[:bytes_read] or b"success" in _response_buffer[:bytes_read]:
+            # find() searches in-place with no allocation; bytearray slice
+            # would copy up to 512 bytes. Anchor to the HTTP status line to
+            # avoid false positives (e.g. a 500 body containing "200").
+            if (_response_buffer.find(b"HTTP/1.1 200", 0, bytes_read) >= 0
+                    or _response_buffer.find(b"HTTP/1.0 200", 0, bytes_read) >= 0
+                    or _response_buffer.find(b"success", 0, bytes_read) >= 0):
                 return True
         except Exception:
             return True  # optimistic: request body was fully sent
@@ -529,9 +532,21 @@ while True:
             _deep_sleep_reset("Watchdog: no upload for " + str(int(WATCHDOG_RESET_S)) + " s")
 
         if mlx is None:
-            print("Sensor not available, waiting...")
-            time.sleep(UPLOAD_INTERVAL)
-            continue
+            print("Sensor not available, re-initializing...")
+            try:
+                gc.collect()
+                if i2c is None:
+                    i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
+                mlx = adafruit_mlx90640.MLX90640(i2c)
+                mlx.refresh_rate = RefreshRate.REFRESH_1_HZ
+                gc.collect()
+                print("Sensor re-initialized")
+            except Exception as e:
+                print("Sensor re-init failed:", e)
+                mlx = None
+                time.sleep(UPLOAD_INTERVAL)
+                continue
+            # mlx is now valid; fall through to getFrame
 
         if not ensure_wifi_connected():
             time.sleep(UPLOAD_INTERVAL)
