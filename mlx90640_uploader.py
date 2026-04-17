@@ -93,10 +93,10 @@ try:
 except Exception:
     mlx = None
 
-# Frame buffers — allocated here, before WiFi, while the heap is still unfragmented.
-# array('f') uses 4 bytes/element (raw float32) vs ~16 bytes for a Python float object
-# in a list, so two 768-element arrays cost 6 KB instead of ~26 KB.
-# Both are pre-allocated so no large contiguous block is needed after uploads begin.
+# Frame buffers — allocated before WiFi while the heap is unfragmented.
+# array('f') stores raw float32 at 4 bytes/element; two 768-element arrays = 6 KB total.
+# No _json_buf is ever pre-allocated: JSON is streamed directly into the socket via
+# HTTP/1.1 chunked transfer encoding, so no contiguous 6 KB block is ever needed.
 gc.collect()
 frame               = array('f', [0.0] * FRAME_SIZE)
 last_uploaded_frame = array('f', [0.0] * FRAME_SIZE)
@@ -143,16 +143,11 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 
 # Color mapping moved to server to save ESP32 memory
 
-# Allocated here, after WiFi but before any fragmentation from getFrame or JSON work.
-# Claiming these contiguous blocks while the heap is still clean avoids the situation
-# where they can't be satisfied after hundreds of small temporary allocs have run.
 _response_buffer = bytearray(512)
-# Worst-case JSON: 768 pixels × 7 bytes ("-199.9,") = 5376 + ~150 header/footer = 5526.
-_json_buf = bytearray(6144)
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
-# Pre-encoded so generate_thermal_json doesn't allocate a new string/bytes on every call
+# Pre-encoded so _upload_thermal_data_once doesn't allocate a new bytes object on every call
 _SENSOR_ID_BYTES = SENSOR_ID.replace('\\', '\\\\').replace('"', '\\"').encode('utf-8')
 
 
@@ -222,6 +217,16 @@ def _send_all_eagain(sock, data):
         total += clen
 
 
+def _send_chunk(sock, data):
+    """Send one HTTP/1.1 Transfer-Encoding: chunked chunk."""
+    n = len(data)
+    if n == 0:
+        return
+    _send_all_eagain(sock, ("%x\r\n" % n).encode())
+    _send_all_eagain(sock, data)
+    _send_all_eagain(sock, b"\r\n")
+
+
 def sanitize_frame_inplace(frame_data):
     """Replace invalid pixels with the min valid temperature, modifying frame_data in-place.
 
@@ -241,60 +246,13 @@ def sanitize_frame_inplace(frame_data):
             frame_data[i] = min_valid
 
 
-def generate_thermal_json(frame_data):
-    """Write JSON into module-level _json_buf; returns a memoryview of the written bytes.
+def _upload_thermal_data_once(frame_data):
+    """Single HTTP POST attempt; streams JSON via chunked transfer encoding.
 
-    Uses slice-assignment instead of bytearray += to avoid repeated reallocs that
-    fragment the heap and cause MemoryError on subsequent mlx.getFrame() calls.
-    _json_buf is allocated on first call so it doesn't consume startup heap.
+    No large JSON buffer is ever allocated: pixels are formatted and sent in
+    32-pixel batches (~250 bytes each) into a pre-allocated local buffer,
+    keeping peak RAM near zero vs the previous 6 KB _json_buf approach.
     """
-    min_temp = 999.0
-    max_temp = -999.0
-    for v in frame_data:
-        if v is not None and v > INVALID_TEMP_THRESHOLD:
-            if v < min_temp:
-                min_temp = v
-            if v > max_temp:
-                max_temp = v
-    if min_temp == 999.0 or max_temp == -999.0:
-        min_temp = 0.0
-        max_temp = 0.0
-
-    pos = 0
-
-    def wr(b):
-        nonlocal pos
-        n = len(b)
-        _json_buf[pos:pos + n] = b
-        pos += n
-
-    wr(b'{"sensor_id":"')
-    wr(_SENSOR_ID_BYTES)
-    wr(b'","w":')
-    wr(str(MLX_SHAPE[1]).encode())
-    wr(b',"h":')
-    wr(str(MLX_SHAPE[0]).encode())
-    wr(b',"min":')
-    wr(("%.1f" % min_temp).encode())
-    wr(b',"max":')
-    wr(("%.1f" % max_temp).encode())
-    wr(b',"t":[')
-    wr(("%.1f" % frame_data[0]).encode())
-    for i in range(1, len(frame_data)):
-        _json_buf[pos] = 44  # ','
-        pos += 1
-        t = ("%.1f" % frame_data[i]).encode()
-        n = len(t)
-        _json_buf[pos:pos + n] = t
-        pos += n
-    _json_buf[pos] = 93    # ']'
-    _json_buf[pos + 1] = 125  # '}'
-    pos += 2
-    return memoryview(_json_buf)[:pos]
-
-
-def _upload_thermal_data_once(json_data):
-    """Single HTTP POST attempt. Uses cached IP for TCP if available."""
     port, path = API_PORT, API_PATH
     peer = API_RESOLVED_IP if API_RESOLVED_IP is not None else API_HOST
     sock = None
@@ -307,18 +265,62 @@ def _upload_thermal_data_once(json_data):
         sock.connect((peer, port))
         time.sleep(3)  # let lwIP complete the TCP handshake before sending
 
-        json_bytes = json_data
         host_header = API_HOST if port == 80 else f"{API_HOST}:{port}"
         request = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: {host_header}\r\n"
             "Content-Type: application/json\r\n"
-            f"Content-Length: {len(json_bytes)}\r\n"
+            "Transfer-Encoding: chunked\r\n"
             "Connection: close\r\n"
             "\r\n"
         )
         _send_all_eagain(sock, request.encode("utf-8"))
-        _send_all_eagain(sock, json_bytes)
+
+        # Compute min/max for the JSON envelope (no extra allocation; frame_data is array('f'))
+        min_temp = 999.0
+        max_temp = -999.0
+        for v in frame_data:
+            if v > INVALID_TEMP_THRESHOLD:
+                if v < min_temp:
+                    min_temp = v
+                if v > max_temp:
+                    max_temp = v
+        if min_temp == 999.0 or max_temp == -999.0:
+            min_temp = 0.0
+            max_temp = 0.0
+
+        # JSON opening: sensor metadata + start of temperature array (~100 bytes)
+        opening = (
+            b'{"sensor_id":"' + _SENSOR_ID_BYTES + b'"'
+            + b',"w":' + str(MLX_SHAPE[1]).encode()
+            + b',"h":' + str(MLX_SHAPE[0]).encode()
+            + b',"min":' + ("%.1f" % min_temp).encode()
+            + b',"max":' + ("%.1f" % max_temp).encode()
+            + b',"t":['
+        )
+        _send_chunk(sock, opening)
+        del opening
+
+        # Stream 768 pixels in 32-pixel batches.  pixel_buf is reused each batch;
+        # peak allocation here is ~256 bytes vs the old 6144 byte _json_buf.
+        pixel_buf = bytearray(256)
+        for batch_start in range(0, FRAME_SIZE, 32):
+            pos = 0
+            batch_end = min(batch_start + 32, FRAME_SIZE)
+            for i in range(batch_start, batch_end):
+                if i > 0:
+                    pixel_buf[pos] = 44  # ','
+                    pos += 1
+                t = ("%.1f" % frame_data[i]).encode()
+                n = len(t)
+                pixel_buf[pos:pos + n] = t
+                pos += n
+            _send_chunk(sock, memoryview(pixel_buf)[:pos])
+        del pixel_buf
+
+        # JSON close + chunked terminator
+        _send_chunk(sock, b"]}")
+        _send_all_eagain(sock, b"0\r\n\r\n")
 
         try:
             bytes_read = sock.recv_into(_response_buffer, 512)
@@ -356,13 +358,13 @@ def _print_upload_oserror(e):
         print(f"Upload error: {e} (errno: {errno})")
 
 
-def upload_thermal_data(json_data):
+def upload_thermal_data(frame_data):
     """Upload thermal data to API server via HTTP POST; retries transient failures."""
     if API_RESOLVED_IP is None:
         _prefetch_api_ip()
     for attempt in range(UPLOAD_MAX_ATTEMPTS):
         try:
-            if _upload_thermal_data_once(json_data):
+            if _upload_thermal_data_once(frame_data):
                 return True
         except OSError as e:
             _print_upload_oserror(e)
@@ -475,17 +477,9 @@ while True:
                 time.sleep(UPLOAD_INTERVAL)
                 continue
 
-        try:
-            json_bytes = generate_thermal_json(frame)
-        except Exception as e:
-            print(f"Error generating JSON: {e}")
-            gc.collect()
-            time.sleep(UPLOAD_INTERVAL)
-            continue
-
         min_temp = min(frame)
         max_temp = max(frame)
-        if upload_thermal_data(json_bytes):
+        if upload_thermal_data(frame):
             upload_count += 1
             consecutive_upload_failures = 0
             # Copy in-place — no new allocation; last_uploaded_frame is pre-allocated
