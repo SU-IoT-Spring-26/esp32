@@ -52,6 +52,12 @@ i2c = None
 try:
     i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
     gc.collect()
+except MemoryError:
+    try:
+        import supervisor
+        supervisor.reload()
+    except Exception:
+        microcontroller.reset()
 except ValueError as e:
     if "in use" in str(e).lower():
         try:

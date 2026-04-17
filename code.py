@@ -63,8 +63,11 @@ except MemoryError:
     # leaving the Python heap too small for I2C init. supervisor.reload() is a
     # soft restart that preserves the already-initialized WiFi state, so the
     # second run sees smaller IDF DRAM overhead and succeeds.
-    import supervisor
-    supervisor.reload()
+    try:
+        import supervisor
+        supervisor.reload()
+    except Exception:
+        microcontroller.reset()
 except ValueError as e:
     if "in use" in str(e).lower():
         try:
@@ -628,10 +631,11 @@ while True:
                 try:
                     wifi.radio.enabled = False
                     gc.collect()
-                    time.sleep(2)
-                    wifi.radio.enabled = True
                 except Exception as e:
                     print("WiFi radio cycle error:", e)
+                # Leave radio disabled; ensure_wifi_connected() on the next
+                # iteration will do one clean enable + connect rather than
+                # cycling it a second time.
 
         gc.collect()
         time.sleep(UPLOAD_INTERVAL)
