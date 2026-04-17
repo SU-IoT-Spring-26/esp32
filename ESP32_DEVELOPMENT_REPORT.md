@@ -175,6 +175,98 @@ The fix uses the IEEE 754 identity that `NaN` is the only value not equal to its
 
 ---
 
+---
+
+## Phase 7 — `espidf.MemoryError` at I2C Init After Watchdog Reset
+
+With the chunked streaming fix in place, the device ran reliably for extended periods. A new failure mode then appeared. When the watchdog triggered (no successful upload for 900 seconds), the script called `microcontroller.reset()` to reboot. On the next boot, the device crashed with a `MemoryError` inside `busio.I2C()` before any user buffers had been allocated — before WiFi, before imports, before almost anything. The serial output showed:
+
+```
+Traceback (most recent call last):
+  File "code.py", line 59, in <module>
+espidf.MemoryError: memory allocation failed, allocating 360 bytes
+```
+
+Line 59 is the `busio.I2C(board.SCL, board.SDA, frequency=400000)` call. The allocation of 360 bytes — a tiny amount — was failing. This was paradoxical: the device had just been running with megabytes of flash and apparently enough RAM to run the full script.
+
+**Root cause: SW_CPU_RESET does not power-cycle the ESP-IDF WiFi stack.** `microcontroller.reset()` in CircuitPython performs an ESP-IDF `esp_restart()`, which maps to a software CPU reset (`SW_CPU_RESET`). This resets the CPU and restarts the firmware, but it does not power-cycle the RF subsystem or release the IDF internal DRAM buffers that the WiFi stack allocated during the previous session. These buffers — approximately 35–40 KB — persist across a software reset, leaving the Python heap 35–40 KB smaller on every reboot via `microcontroller.reset()` than on a cold boot. Since the Python heap is only approximately 100–120 KB after the ESP-IDF runtime itself, losing 35–40 KB to stale WiFi buffers left insufficient room for even a 360-byte I2C allocation.
+
+**Fix: replace `microcontroller.reset()` with deep sleep.** `alarm.exit_and_deep_sleep_until_alarms()` causes the ESP32 to fully power down, including the RF subsystem. When the device wakes from deep sleep, the IDF WiFi stack is completely uninitialized and its DRAM has been released. The heap on wake is identical to a cold boot. The `_deep_sleep_reset()` helper was added to encapsulate this pattern, with a 5-second delay to give any in-progress operations time to finish, and a `microcontroller.reset()` fallback for environments where the `alarm` module is unavailable.
+
+The `alarm` module is imported lazily inside `_deep_sleep_reset()` rather than at the top of the script. A module-level import would add the module to the heap for the entire lifetime of the script, consuming heap space on every run even though the reset path is rarely taken.
+
+---
+
+## Phase 8 — Persistent MemoryError After Optimizations (Diagnostic Investigation)
+
+After the deep sleep fix, the device still produced `Memory error reading frame` on every iteration except the first. To understand exactly what was consuming heap, `gc.mem_free()` diagnostic prints were added at each stage of initialization. The output revealed the actual heap budget:
+
+```
+mem/imports:  44960   # only 45 KB free after all imports
+mem/MLX:      44416   # MLX object costs 544 bytes
+mem/bufs:     39904   # pre-allocated buffers cost ~4.5 KB
+mem/WiFi:     39680   # WiFi lives in IDF DRAM — barely touches Python heap
+mem/getFrame: 39152   → Upload #1: SUCCESS
+mem/getFrame: 36064   → Memory error reading frame (1/10)
+mem/getFrame: 35856   → Memory error reading frame (still failing after GC)
+```
+
+Several discoveries from this output:
+
+**The Python heap is only 45 KB after imports, not 100–120 KB.** The 100–120 KB figure was the total DRAM available before any Python runtime initialization. After loading CircuitPython, all library modules, the WiFi stack, and the runtime itself, only 45 KB remained for user allocations. Every estimate in Phases 1–6 about "room" for buffers had been based on an incorrect figure.
+
+**WiFi does not consume Python heap.** The WiFi stack (`wifi.radio.connect()`) uses IDF DRAM, which is in a separate memory region not tracked by `gc.mem_free()`. This explained why the pre-WiFi allocation strategy had seemed wrong in earlier phases — checking `gc.mem_free()` before and after WiFi connection showed almost no change, yet the heap was still fragmented after connecting.
+
+**`last_uploaded_frame` was the culprit.** The version under test had `last_uploaded_frame = None` at startup (not pre-allocated). The array was allocated lazily inside the upload function on first successful upload: `last_uploaded_frame = array('f', frame)`. This 3 KB allocation happened after the first `getFrame()` had run and after the upload's socket temporaries had been freed. The result was a 3 KB array inserted into the middle of a heap that now had small holes punched through it by socket and send-buffer temporaries. On the second iteration, `getFrame()` needed a contiguous block of approximately 3–4 KB for its internal I2C read buffers, but the 3 KB `last_uploaded_frame` now occupied the only contiguous block of that size. `gc.collect()` could not help — `last_uploaded_frame` was still alive and could not be moved.
+
+The fix: pre-allocate `last_uploaded_frame` before WiFi, identical to all other large buffers. This places the 3 KB array at a predictable location in the heap before fragmentation begins, leaving a single contiguous free block at the high end of the heap that `getFrame()` can reliably use.
+
+---
+
+## Phase 9 — `mlx90640_simple.py`: A Reliable Baseline
+
+To establish a guaranteed-working reference while continuing to debug the full uploader, a stripped-down version called `mlx90640_simple.py` was created. This version:
+
+- Uploads every frame unconditionally, every 15 seconds, with no delta gate
+- Has no `last_uploaded_frame` buffer at all (saving 3 KB vs the full uploader)
+- Uses all the memory optimizations developed in Phases 4–6: chunked streaming, `array('f')` for the frame buffer, `_write_temp_into()`, `_write_hex_crlf()`, `_REQUEST_BYTES` pre-built, `memoryview` wrapping
+- Uses deep sleep for all resets
+- Has a single upload attempt per cycle (no retry)
+
+This version was deployed to the device and ran for 2,042 successful uploads without a single MemoryError, confirming that the optimizations were correct and that the delta gate's `last_uploaded_frame` was the remaining source of instability.
+
+---
+
+## Phase 10 — Mean-Based Delta Gate (Final Architecture)
+
+With a working baseline established, the goal was to reintroduce the delta gate without reintroducing `last_uploaded_frame`. The key insight was that occupancy detection does not require comparing every pixel between frames. It only needs to detect significant thermal changes in the scene — people entering or leaving. A person entering a room raises the scene's mean temperature by approximately 0.3–2°C depending on field of view and sensor mounting height. Monitoring the mean temperature change requires storing exactly **one float** (`last_frame_mean`) rather than a 768-float array (3 KB).
+
+The revised algorithm:
+- On each frame, compute mean temperature in the same pass as min/max (no extra iteration)
+- If `|mean_temp - last_frame_mean| < MIN_MEAN_DELTA_C` and a heartbeat is not due, skip the upload
+- Otherwise upload and update `last_frame_mean`
+- Heartbeat: force an upload at least every `HEARTBEAT_INTERVAL_S` seconds regardless of the delta, so the API always receives fresh data even in a static, empty room
+
+**Heartbeat interval calibration.** An initial heartbeat interval of 600 seconds (10 minutes) was tried. In a static room, the mean temperature barely drifts, so almost every frame is skipped and the heartbeat becomes the only upload path. At 10 minutes between uploads, the device appeared to be malfunctioning — the dashboard would show stale data for long periods and the watchdog threshold (900 seconds) was uncomfortably close to the heartbeat interval. The heartbeat was reduced to **60 seconds**, which provides regular uploads in static rooms while still reducing traffic approximately 4× compared to uploading every frame.
+
+---
+
+## Phase 11 — Bug Review of the Final `code.py`
+
+Before finalizing the code, a systematic comparison of the device's running `code.py` against the known-good `mlx90640_simple.py` revealed three bugs:
+
+**Bug 1: `HEARTBEAT_INTERVAL_S = 600.0`** — the 10-minute value from the initial attempt (see Phase 10) had not been changed after the interval was identified as too long. This was the direct cause of only 1 upload being produced during testing. Fixed to `60.0`.
+
+**Bug 2: `_deep_sleep_reset` called before it was defined.** The initial WiFi connection loop at module level (lines ~180–196) called `_deep_sleep_reset("WiFi unrecoverable")` in its `else` clause if all 5 attempts failed. The `_deep_sleep_reset` function was defined later in the file, at approximately line 214. In Python, a `def` statement is executed when the interpreter reaches it during module loading; the function does not exist in the namespace until then. If all 5 WiFi attempts failed during the initial connection loop, the `else` clause would raise `NameError: name '_deep_sleep_reset' is not defined` instead of performing the reset. The fix was to move `_deep_sleep_reset` above the WiFi block.
+
+**Bug 3: `bytearray` slice off-by-one in `_opening_buf` construction.** The line:
+```python
+_opening_buf[_op_pos:_op_pos+6] = b',"h":'; _op_pos += 5  # note: 5 not 6
+```
+assigns a 5-byte bytes literal to a 6-byte slice. In MicroPython/CircuitPython, assigning a shorter bytes object to a longer slice shrinks the bytearray by 1 byte. The `_opening_buf` buffer would become 119 bytes instead of 120. The `_op_pos` counter was correct (incremented by 5), so subsequent writes would land in the right positions, but the buffer's total length was permanently reduced. With 120-byte margin this caused no observable failure, but it was still a latent error. Fixed to `_opening_buf[_op_pos:_op_pos+5] = b',"h":'`.
+
+---
+
 ## Summary of What Failed and Why
 
 | Attempt | What Was Tried | Why It Failed |
@@ -201,3 +293,47 @@ The fix uses the IEEE 754 identity that `NaN` is the only value not equal to its
 | WiFi radio cycle | `enabled = False` then `True` | Recovers from "associated but not routing" stale connection |
 | I2C at 400 kHz with deinit fallback | Explicit frequency; handle `in use` | Correct sensor timing; survives script restart without power cycle |
 | `_SENSOR_ID_BYTES` pre-encoded | Encode sensor ID once at module level | Avoids repeated string allocation in the hot upload path |
+| Mean-based delta gate | One float `last_frame_mean` vs 3 KB `last_uploaded_frame` | Eliminates the heap fragmentation that caused MemoryError after first upload |
+| `HEARTBEAT_INTERVAL_S = 60` | Force upload every 60 s in static room | Provides regular data flow without appearing broken; safe distance from 900 s watchdog |
+| `_deep_sleep_reset()` for all resets | `alarm.exit_and_deep_sleep_until_alarms()` instead of `microcontroller.reset()` | Prevents `espidf.MemoryError` at I2C init caused by stale IDF WiFi DRAM after SW_CPU_RESET |
+| `_deep_sleep_reset` defined before WiFi block | Move function def above its first call site | Prevents `NameError` if all 5 initial WiFi attempts fail |
+
+---
+
+## Final Architecture: `code.py` Safeguards
+
+The final version of `code.py` (also mirrored as `mlx90640_uploader.py`) provides reliable continuous operation through the following layered safeguards:
+
+### Memory Safety
+- All large buffers (`frame`, `_response_buffer`, `_pixel_buf`, `_opening_buf`, `_hex_buf`, `_REQUEST_BYTES`, all `memoryview` wrappers) are allocated at module level **before** WiFi connects, preserving a single contiguous free block that `getFrame()` can always use.
+- The delta gate uses one float (`last_frame_mean`) rather than a 768-float reference frame, keeping the allocation budget 3 KB smaller than the original design.
+- JSON is streamed in 32-pixel batches via HTTP chunked transfer encoding — no large JSON string is ever constructed on the heap.
+- Zero-allocation helpers `_write_temp_into()` and `_write_hex_crlf()` replace `("%.1f" % v).encode()` and `('%x\r\n' % n).encode()`, eliminating approximately 1,600 per-upload heap allocations.
+- `memoryview` is used throughout `_send_all_eagain()` so that slicing the send buffer never copies bytes.
+- The `alarm` module is imported lazily inside `_deep_sleep_reset()` only, not at startup.
+
+### Sensor Reliability
+- I2C bus is initialised at 400 kHz (fast mode) explicitly, with a `board.I2C().deinit()` fallback if the bus is already claimed from a previous run.
+- MLX90640 refresh rate is set to 1 Hz — matching the 15-second poll interval, reducing sensor self-heating artifacts and I2C traffic.
+- Consecutive MemoryErrors on `getFrame()` are tolerated up to 10 times before triggering a reset, in case of transient errors.
+- After 5 consecutive sensor read failures, the sensor is re-initialised in-place without a reboot.
+- NaN values from the sensor are detected via the IEEE 754 identity `v != v` and replaced with the frame's minimum valid temperature before upload, preventing JSON parse errors at the API.
+
+### Network Reliability
+- WiFi radio is cycled (`enabled = False / True`) before every connection attempt, clearing stale ESP-IDF RF association state left by `SW_CPU_RESET`.
+- DNS resolution is performed once after WiFi connects and the result is cached in `API_RESOLVED_IP`. If a DNS failure is reported by `_print_upload_oserror()`, the cache is cleared and re-resolved on the next attempt.
+- `time.sleep(3)` after `sock.connect()` gives the lwIP TCP stack time to complete the 3-way handshake before the first `sock.send()`.
+- Up to 3 upload attempts are made per cycle, with 1 second between attempts.
+- After 5 consecutive upload failures, the WiFi radio is cycled to recover from the "associated but not routing" state that `wifi.radio.connected` cannot detect.
+- `OSError` codes from failed uploads are decoded to human-readable messages (host unreachable, connection refused, timeout, DNS failure, EAGAIN) for easier serial-console diagnosis.
+- `KeyboardInterrupt` (caused by DTR line toggles from serial terminal connect/disconnect on CH340/CP2102 boards) is caught at the outermost loop level and silently ignored, so the script survives plugging in a monitor.
+
+### Watchdog and Recovery
+- A software watchdog tracks the time since the last successful upload. If no upload succeeds for 900 seconds, `_deep_sleep_reset()` is called.
+- `_deep_sleep_reset()` uses `alarm.exit_and_deep_sleep_until_alarms()` with a 5-second delay. Deep sleep fully powers down the RF subsystem and clears all IDF DRAM, ensuring a clean boot with full heap available. This is critical — `microcontroller.reset()` (SW_CPU_RESET) does not clear IDF DRAM and causes `espidf.MemoryError` at I2C init on the next boot.
+- If the `alarm` module is unavailable, `microcontroller.reset()` is used as a fallback.
+
+### Delta Gate
+- Uploads are skipped when the scene's mean temperature has changed by less than `MIN_MEAN_DELTA_C` (0.2°C) since the last upload, reducing traffic in static rooms.
+- A heartbeat forces an upload at least every `HEARTBEAT_INTERVAL_S` (60 seconds) regardless of the delta, ensuring fresh data reaches the API continuously.
+- The heartbeat interval (60 s) is small enough that the dashboard never appears stale and the watchdog threshold (900 s) is safely far away.
