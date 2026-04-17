@@ -58,6 +58,13 @@ i2c = None
 try:
     i2c = busio.I2C(board.SCL, board.SDA, frequency=400000)
     gc.collect()
+except MemoryError:
+    # On cold power-on the ESP-IDF WiFi cold-start allocates extra IDF DRAM,
+    # leaving the Python heap too small for I2C init. supervisor.reload() is a
+    # soft restart that preserves the already-initialized WiFi state, so the
+    # second run sees smaller IDF DRAM overhead and succeeds.
+    import supervisor
+    supervisor.reload()
 except ValueError as e:
     if "in use" in str(e).lower():
         try:
