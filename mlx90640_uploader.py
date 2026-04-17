@@ -93,9 +93,14 @@ try:
 except Exception:
     mlx = None
 
-# Frame buffer for thermal data
+# Frame buffers — allocated here, before WiFi, while the heap is still unfragmented.
+# array('f') uses 4 bytes/element (raw float32) vs ~16 bytes for a Python float object
+# in a list, so two 768-element arrays cost 6 KB instead of ~26 KB.
+# Both are pre-allocated so no large contiguous block is needed after uploads begin.
 gc.collect()
-frame = [0.0] * FRAME_SIZE
+frame               = array('f', [0.0] * FRAME_SIZE)
+last_uploaded_frame = array('f', [0.0] * FRAME_SIZE)
+has_last_upload     = False
 gc.collect()
 
 # WiFi configuration
@@ -138,12 +143,12 @@ _SEND_EAGAIN_SLEEP_S = 0.1
 
 # Color mapping moved to server to save ESP32 memory
 
-# Allocated once to avoid repeated heap churn on every upload
+# Allocated here, after WiFi but before any fragmentation from getFrame or JSON work.
+# Claiming these contiguous blocks while the heap is still clean avoids the situation
+# where they can't be satisfied after hundreds of small temporary allocs have run.
 _response_buffer = bytearray(512)
-# Allocated on first use (after getFrame clears its internal temporaries).
-# Worst-case size: 768 pixels × 7 bytes ("-199.9,") = 5376 + ~150 bytes header/footer = 5526.
-# 6144 gives a safe margin.
-_json_buf = None
+# Worst-case JSON: 768 pixels × 7 bytes ("-199.9,") = 5376 + ~150 header/footer = 5526.
+_json_buf = bytearray(6144)
 
 INVALID_TEMP_THRESHOLD = -200.0  # Treat anything below this as invalid (e.g. -273.15°C)
 
@@ -243,9 +248,6 @@ def generate_thermal_json(frame_data):
     fragment the heap and cause MemoryError on subsequent mlx.getFrame() calls.
     _json_buf is allocated on first call so it doesn't consume startup heap.
     """
-    global _json_buf
-    if _json_buf is None:
-        _json_buf = bytearray(6144)
     min_temp = 999.0
     max_temp = -999.0
     for v in frame_data:
@@ -407,7 +409,6 @@ if mlx is None:
 
 upload_count = 0
 skip_count = 0
-last_uploaded_frame = None  # array('f') snapshot after each successful upload; None = upload next
 last_upload_time = None     # monotonic timestamp of last successful upload
 sensor_fail_count = 0
 MAX_SENSOR_FAILS = 5  # Re-initialize sensor after this many consecutive failures
@@ -466,7 +467,7 @@ while True:
             last_upload_time is None
             or (time.monotonic() - last_upload_time) >= HEARTBEAT_INTERVAL_S
         )
-        if MIN_MEAN_DELTA_C > 0 and last_uploaded_frame is not None and not heartbeat_due:
+        if MIN_MEAN_DELTA_C > 0 and has_last_upload and not heartbeat_due:
             delta = mean_abs_frame_diff(frame, last_uploaded_frame)
             if delta < MIN_MEAN_DELTA_C:
                 skip_count += 1
@@ -487,8 +488,10 @@ while True:
         if upload_thermal_data(json_bytes):
             upload_count += 1
             consecutive_upload_failures = 0
-            # array('f') snapshot: 3 KB instead of ~13 KB for a Python float list
-            last_uploaded_frame = array('f', frame)
+            # Copy in-place — no new allocation; last_uploaded_frame is pre-allocated
+            for _i in range(FRAME_SIZE):
+                last_uploaded_frame[_i] = frame[_i]
+            has_last_upload = True
             last_upload_time = time.monotonic()
             msg = f"Upload #{upload_count}: {min_temp:.1f}°C - {max_temp:.1f}°C"
             if skip_count:
