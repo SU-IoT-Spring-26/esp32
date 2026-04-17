@@ -188,6 +188,8 @@ def _prefetch_api_ip():
 
 def _send_all_eagain(sock, data):
     """Send buffer in chunks; retry on EAGAIN (errno 11)."""
+    if not isinstance(data, memoryview):
+        data = memoryview(data)
     total = 0
     n = len(data)
     chunk_size = 256
@@ -236,13 +238,16 @@ def sanitize_frame_inplace(frame_data):
     """
     min_valid = None
     for v in frame_data:
-        if v is not None and v > INVALID_TEMP_THRESHOLD:
+        # v == v is False only for NaN (IEEE 754); catches sensor noise artifacts
+        if v == v and v > INVALID_TEMP_THRESHOLD:
             if min_valid is None or v < min_valid:
                 min_valid = v
     if min_valid is None:
         min_valid = 0.0
     for i in range(len(frame_data)):
-        if frame_data[i] is None or frame_data[i] <= INVALID_TEMP_THRESHOLD:
+        v = frame_data[i]
+        # v != v catches NaN; array('f') never contains None so no None check needed
+        if v != v or v <= INVALID_TEMP_THRESHOLD:
             frame_data[i] = min_valid
 
 
