@@ -600,6 +600,9 @@ while True:
         if MIN_MEAN_DELTA_C > 0 and last_frame_mean is not None and not heartbeat_due:
             if abs(mean_temp - last_frame_mean) < MIN_MEAN_DELTA_C:
                 skip_count += 1
+                hb_in = int(HEARTBEAT_INTERVAL_S - (time.monotonic() - last_upload_time))
+                print("Skip #", skip_count, " delta=",
+                      abs(mean_temp - last_frame_mean), " hb_in=", hb_in, "s", sep="")
                 gc.collect()
                 time.sleep(UPLOAD_INTERVAL)
                 continue
